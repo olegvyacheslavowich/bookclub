@@ -1,0 +1,4 @@
+/data/
+/bookclub
+*.tmp
+.env

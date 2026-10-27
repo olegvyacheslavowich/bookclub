@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Книжный клуб</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <button id="back" class="btn-link back" type="button" hidden>← Назад</button>
+
+  <nav id="tabs" class="tabs" aria-label="Разделы">
+    <a class="tab" href="#/books" data-tab="books">📚 Книги</a>
+    <a class="tab" href="#/meetings" data-tab="meetings">📅 Встречи</a>
+  </nav>
+
+  <main id="view" aria-live="polite"></main>
+
+  <footer id="footer"></footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
