@@ -16,9 +16,8 @@ import (
 // ---- DTOs: what the front end sees. Telegram user IDs of other members are never exposed. ----
 
 type meDTO struct {
-	ID      int64  `json:"id"`
-	Name    string `json:"name"`
-	IsAdmin bool   `json:"isAdmin"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
 type ratingDTO struct {
@@ -73,7 +72,7 @@ type meetingDTO struct {
 // ---- me ----
 
 func (s *Server) me(w http.ResponseWriter, _ *http.Request, u store.Person) {
-	writeJSON(w, http.StatusOK, meDTO{ID: u.ID, Name: u.Name, IsAdmin: s.isAdmin(u.ID)})
+	writeJSON(w, http.StatusOK, meDTO{ID: u.ID, Name: u.Name})
 }
 
 // ---- books ----
@@ -106,7 +105,7 @@ func (s *Server) toBookDTO(b store.Book, acc ratingAcc, u store.Person) bookDTO 
 		ID: b.ID, Title: b.Title, Author: b.Author, Link: b.Link, Note: b.Note,
 		AddedBy: b.AddedBy.Name, CreatedAt: b.CreatedAt,
 		Rating: acc.dto(), MyRating: acc.mine,
-		CanDelete: s.isAdmin(u.ID) || b.AddedBy.ID == u.ID,
+		CanDelete: b.AddedBy.ID == u.ID,
 	}
 }
 
@@ -115,7 +114,7 @@ func (s *Server) toReviewDTO(r store.Review, u store.Person) reviewDTO {
 		ID: r.ID, Author: r.Author.Name, Rating: r.Rating, Text: r.Text,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		Mine:      r.Author.ID == u.ID,
-		CanDelete: s.isAdmin(u.ID) || r.Author.ID == u.ID,
+		CanDelete: r.Author.ID == u.ID,
 	}
 }
 
@@ -199,8 +198,8 @@ func (s *Server) deleteBook(w http.ResponseWriter, r *http.Request, u store.Pers
 		writeError(w, http.StatusNotFound, "Книга не найдена — возможно, её уже удалили.")
 		return
 	}
-	if !s.isAdmin(u.ID) && b.AddedBy.ID != u.ID {
-		writeError(w, http.StatusForbidden, "Удалить книгу может только тот, кто её добавил, или администратор.")
+	if b.AddedBy.ID != u.ID {
+		writeError(w, http.StatusForbidden, "Удалить книгу может только тот, кто её добавил.")
 		return
 	}
 	if err := s.store.DeleteBook(b.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -249,8 +248,8 @@ func (s *Server) deleteReview(w http.ResponseWriter, r *http.Request, u store.Pe
 		writeError(w, http.StatusNotFound, "Отзыв не найден — возможно, его уже удалили.")
 		return
 	}
-	if !s.isAdmin(u.ID) && rv.Author.ID != u.ID {
-		writeError(w, http.StatusForbidden, "Удалить отзыв может только его автор или администратор.")
+	if rv.Author.ID != u.ID {
+		writeError(w, http.StatusForbidden, "Удалить отзыв может только его автор.")
 		return
 	}
 	if err := s.store.DeleteReview(rv.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -307,18 +306,8 @@ func (in meetingInput) validate() (store.Meeting, error) {
 	return m, nil
 }
 
-func (s *Server) requireAdmin(w http.ResponseWriter, u store.Person) bool {
-	if s.isAdmin(u.ID) {
-		return true
-	}
-	writeError(w, http.StatusForbidden, "Назначать и менять встречи может только администратор клуба.")
-	return false
-}
-
+// Any club member may schedule, change or cancel a meeting: the club has no administrators.
 func (s *Server) createMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
-	if !s.requireAdmin(w, u) {
-		return
-	}
 	var in meetingInput
 	if !decodeJSON(w, r, &in) {
 		return
@@ -333,10 +322,7 @@ func (s *Server) createMeeting(w http.ResponseWriter, r *http.Request, u store.P
 	s.respondMeeting(w, r, http.StatusCreated, saved, err)
 }
 
-func (s *Server) updateMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
-	if !s.requireAdmin(w, u) {
-		return
-	}
+func (s *Server) updateMeeting(w http.ResponseWriter, r *http.Request, _ store.Person) {
 	var in meetingInput
 	if !decodeJSON(w, r, &in) {
 		return
@@ -368,10 +354,7 @@ func (s *Server) respondMeeting(w http.ResponseWriter, r *http.Request, status i
 	}
 }
 
-func (s *Server) deleteMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
-	if !s.requireAdmin(w, u) {
-		return
-	}
+func (s *Server) deleteMeeting(w http.ResponseWriter, r *http.Request, _ store.Person) {
 	err := s.store.DeleteMeeting(r.PathValue("id"))
 	switch {
 	case errors.Is(err, store.ErrNotFound):

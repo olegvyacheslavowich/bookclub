@@ -46,32 +46,26 @@ type MemberChecker interface {
 }
 
 type Config struct {
-	Store    Store
-	Auth     Authenticator
-	Members  MemberChecker // nil disables the club membership check
-	AdminIDs []int64       // may manage meetings and delete any book or review
-	DevMode  bool          // accept "Authorization: dev <id>:<name>"; never enable in production
-	Static   fs.FS
-	Logger   *slog.Logger
+	Store   Store
+	Auth    Authenticator
+	Members MemberChecker // nil disables the club membership check
+	DevMode bool          // accept "Authorization: dev <id>:<name>"; never enable in production
+	Static  fs.FS
+	Logger  *slog.Logger
 }
 
 type Server struct {
 	store   Store
 	auth    Authenticator
 	members MemberChecker
-	admins  map[int64]bool
 	devMode bool
 	static  fs.FS
 	log     *slog.Logger
 
-	seen sync.Map // user IDs already logged, so admins can find their ID in the log
+	seen sync.Map // user IDs already logged, so each member appears in the log once
 }
 
 func New(cfg Config) *Server {
-	admins := make(map[int64]bool, len(cfg.AdminIDs))
-	for _, id := range cfg.AdminIDs {
-		admins[id] = true
-	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -80,7 +74,6 @@ func New(cfg Config) *Server {
 		store:   cfg.Store,
 		auth:    cfg.Auth,
 		members: cfg.Members,
-		admins:  admins,
 		devMode: cfg.DevMode,
 		static:  cfg.Static,
 		log:     logger,
@@ -153,7 +146,7 @@ func (s *Server) withUser(h userHandler) http.Handler {
 		}
 
 		if _, loaded := s.seen.LoadOrStore(u.ID, true); !loaded {
-			s.log.Info("user seen", "id", u.ID, "name", u.Name, "admin", s.isAdmin(u.ID))
+			s.log.Info("user seen", "id", u.ID, "name", u.Name)
 		}
 		h(w, r, u)
 	})
@@ -198,8 +191,6 @@ const (
 	errNoCredentials = authError("no supported Authorization header")
 	errBadDevUser    = authError("dev auth must look like 'dev <id>:<name>'")
 )
-
-func (s *Server) isAdmin(id int64) bool { return s.admins[id] }
 
 // ---- middleware ----
 

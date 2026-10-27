@@ -10,8 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -27,7 +25,6 @@ type config struct {
 	dataFile   string
 	botToken   string
 	chatID     string
-	adminIDs   []int64
 	devMode    bool
 	initMaxAge time.Duration
 }
@@ -47,17 +44,6 @@ func loadConfig() (config, error) {
 	}
 	if c.chatID != "" && c.botToken == "" {
 		return c, errors.New("CLUB_CHAT_ID needs BOT_TOKEN to check membership")
-	}
-
-	for _, part := range strings.Split(os.Getenv("ADMIN_IDS"), ",") {
-		if part = strings.TrimSpace(part); part == "" {
-			continue
-		}
-		id, err := strconv.ParseInt(part, 10, 64)
-		if err != nil {
-			return c, fmt.Errorf("ADMIN_IDS: %q is not a Telegram user ID", part)
-		}
-		c.adminIDs = append(c.adminIDs, id)
 	}
 
 	if v := os.Getenv("INITDATA_MAX_AGE"); v != "" {
@@ -105,21 +91,17 @@ func run(log *slog.Logger) error {
 	} else {
 		log.Warn("CLUB_CHAT_ID is not set: anyone who opens the Mini App gets access")
 	}
-	if len(cfg.adminIDs) == 0 {
-		log.Warn("ADMIN_IDS is empty: nobody can manage meetings; user IDs appear in the log as 'user seen'")
-	}
 	if cfg.devMode {
 		log.Warn("DEV_MODE=1: requests can impersonate any user. Never run like this in production")
 	}
 
 	srv := api.New(api.Config{
-		Store:    st,
-		Auth:     auth.NewValidator(cfg.botToken, cfg.initMaxAge),
-		Members:  members,
-		AdminIDs: cfg.adminIDs,
-		DevMode:  cfg.devMode,
-		Static:   web.FS(),
-		Logger:   log,
+		Store:   st,
+		Auth:    auth.NewValidator(cfg.botToken, cfg.initMaxAge),
+		Members: members,
+		DevMode: cfg.devMode,
+		Static:  web.FS(),
+		Logger:  log,
 	})
 
 	httpSrv := &http.Server{
@@ -136,7 +118,7 @@ func run(log *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.addr, "data", cfg.dataFile, "admins", len(cfg.adminIDs))
+		log.Info("listening", "addr", cfg.addr, "data", cfg.dataFile)
 		errCh <- httpSrv.ListenAndServe()
 	}()
 

@@ -204,8 +204,23 @@ h1, h2, p { margin: 0; }
 
 .my-mark { margin-top: 6px; color: var(--link); font-size: 15px; font-weight: 600; }
 
-.search {
-  margin-top: 14px;
+.search-wrap { position: relative; margin-top: 14px; }
+.search-wrap .search { padding-right: 52px; }
+.search::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; } /* we draw our own, bigger ✕ */
+
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--hint);
+  font-size: 20px;
+  cursor: pointer;
+  transform: translateY(-50%);
 }
 
 .rating-summary {

@@ -14,7 +14,7 @@
   const $footer = document.getElementById('footer');
   const $toast = document.getElementById('toast');
 
-  let me = null;      // { id, name, isAdmin }
+  let me = null;      // { id, name }
   let renderSeq = 0;  // bumps on every navigation; late async results for old screens are dropped
 
   // ---------------------------------------------------------------- Telegram helpers
@@ -289,6 +289,11 @@
 
   // ---------------------------------------------------------------- screens: books
 
+  // Search ignores case, ё/е and quotes; every word of the query must appear in the title or author,
+  // so "булгаков мастер" finds «Мастер и Маргарита».
+  const normalize = (str) => str.toLowerCase().replace(/ё/g, 'е').replace(/[«»"„“”']/g, '').replace(/\s+/g, ' ').trim();
+  let booksQuery = ''; // kept while the app is open, so going into a book and back keeps the filter
+
   function renderBooks(seq) {
     load(seq, async () => {
       const { books } = await api('GET', 'api/books');
@@ -297,29 +302,40 @@
         return [add, empty('Пока нет ни одной книги', 'Нажмите «Добавить книгу» — и она появится здесь для всего клуба.')];
       }
 
-      const items = books.map((b) => ({ el: bookCard(b), key: `${b.title} ${b.author || ''}`.toLowerCase() }));
-      const nodes = [add];
+      const items = books.map((b) => ({ el: bookCard(b), key: normalize(`${b.title} ${b.author || ''}`) }));
+      const title = h('h2', { class: 'section-title' });
+      const nothing = h('div', { class: 'card empty', hidden: true },
+        h('div', { class: 'empty-title' }, 'Ничего не нашлось'),
+        h('p', { class: 'hint' }, 'Проверьте написание или поищите по фамилии автора.'));
 
-      if (books.length > 6) {
-        const nothing = h('p', { class: 'hint center', hidden: true }, 'Ничего не нашлось');
-        const search = h('input', {
-          type: 'search', class: 'search', placeholder: 'Найти книгу или автора', 'aria-label': 'Поиск по книгам',
-          oninput: (e) => {
-            const q = e.target.value.trim().toLowerCase();
-            let shown = 0;
-            for (const it of items) {
-              it.el.hidden = !!q && !it.key.includes(q);
-              if (!it.el.hidden) shown++;
-            }
-            nothing.hidden = shown > 0;
-          },
-        });
-        nodes.push(search, nothing);
+      const input = h('input', {
+        type: 'search', id: 'book-search', class: 'search', autocomplete: 'off', enterkeyhint: 'search',
+        placeholder: 'Поиск: название или автор', 'aria-label': 'Поиск по книгам клуба', value: booksQuery,
+        oninput: () => apply(),
+        // "Search" on the phone keyboard just hides the keyboard: results are already on screen.
+        onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } },
+      });
+      const clear = h('button', {
+        type: 'button', class: 'search-clear', 'aria-label': 'Очистить поиск', hidden: true,
+        onclick: () => { input.value = ''; apply(); input.focus(); },
+      }, '✕');
+
+      function apply() {
+        booksQuery = input.value;
+        const words = normalize(booksQuery).split(' ').filter(Boolean);
+        let shown = 0;
+        for (const it of items) {
+          it.el.hidden = !words.every((w) => it.key.includes(w));
+          if (!it.el.hidden) shown++;
+        }
+        clear.hidden = !booksQuery;
+        nothing.hidden = shown > 0;
+        title.textContent = words.length ? `Найдено: ${shown} из ${books.length}` : `Книги клуба · ${books.length}`;
       }
+      apply();
 
-      nodes.push(h('h2', { class: 'section-title' }, `Книги клуба · ${books.length}`),
-        h('div', { class: 'list' }, items.map((it) => it.el)));
-      return nodes;
+      return [add, h('div', { class: 'search-wrap' }, input, clear), title, nothing,
+        h('div', { class: 'list' }, items.map((it) => it.el))];
     });
   }
 
@@ -513,12 +529,10 @@
       const upcoming = meetings.filter((m) => new Date(m.startsAt).getTime() + STILL_UPCOMING_MS >= now);
       const past = meetings.filter((m) => !upcoming.includes(m)).reverse();
 
-      const nodes = [];
-      if (me.isAdmin) nodes.push(h('a', { class: 'btn btn-primary', href: '#/meetings/new' }, '+ Назначить встречу'));
+      const nodes = [h('a', { class: 'btn btn-primary', href: '#/meetings/new' }, '+ Назначить встречу')];
 
       if (!upcoming.length) {
-        nodes.push(empty('Ближайших встреч пока нет',
-          me.isAdmin ? 'Нажмите «Назначить встречу», чтобы добавить дату.' : 'Как только дату назначат, она появится здесь.'));
+        nodes.push(empty('Ближайших встреч пока нет', 'Нажмите «Назначить встречу», чтобы добавить дату.'));
       } else {
         const [next, ...rest] = upcoming;
         nodes.push(h('h2', { class: 'section-title' }, 'Ближайшая встреча'), meetingCard(next, true));
@@ -549,14 +563,10 @@
         h('span', null, `«${m.book.title}»${m.book.author ? ', ' + m.book.author : ''}`)),
       m.note && h('p', { class: 'note' }, m.note),
       online && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => openExternal(m.place) }, 'Подключиться онлайн ↗'),
-      me.isAdmin && h('a', { class: 'btn btn-secondary', href: `#/meetings/${m.id}/edit` }, 'Изменить'));
+      h('a', { class: 'btn btn-secondary', href: `#/meetings/${m.id}/edit` }, 'Изменить'));
   }
 
   function renderMeetingForm(seq, id) {
-    if (!me.isAdmin) {
-      $view.replaceChildren(errorBox(new ApiError(403, 'Назначать встречи может только администратор клуба.')));
-      return;
-    }
     load(seq, async () => {
       const [booksResp, meetingsResp] = await Promise.all([api('GET', 'api/books'), id ? api('GET', 'api/meetings') : null]);
       const current = id ? meetingsResp.meetings.find((x) => x.id === id) : null;
@@ -578,7 +588,7 @@
         onsubmit: async (e) => {
           e.preventDefault();
           err.hide();
-          const startsAt = new Date(`${date.value}T${time.value}`); // local time of the admin's phone
+          const startsAt = new Date(`${date.value}T${time.value}`); // local time of the member's phone
           if (!date.value || !time.value || isNaN(startsAt)) {
             err.show('Укажите дату и время встречи.');
             return;
@@ -673,7 +683,7 @@
       $view.replaceChildren(errorBox(err));
       return;
     }
-    $footer.textContent = `Вы вошли как ${me.name} · ID ${me.id}${me.isAdmin ? ' · администратор' : ''}`;
+    $footer.textContent = `Вы вошли как ${me.name}`;
     if (routes.some(([re]) => re.test(location.hash))) render(true);
     else location.replace('#/books');
   }
