@@ -1,4 +1,3 @@
-.git
-data
-bookclub
-.env
+# The image only needs the prebuilt binary.
+*
+!dist/bookclub

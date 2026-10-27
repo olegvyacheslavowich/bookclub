@@ -1,19 +1,26 @@
-// Package store keeps club data in a single JSON file.
+// Package store keeps all club data as one JSON document.
 //
-// A book club produces a few hundred records per year, so the whole dataset lives in memory
-// and every change rewrites the file atomically (temp file + fsync + rename). If the app ever
-// outgrows this, swap FileStore for a SQLite implementation of api.Store; nothing else changes.
+// A book club produces a few hundred records per year, so the whole dataset lives in memory and
+// every change writes the document back as a whole. Where it is written is up to the backend:
+//
+//   - a local file (OpenFile): for a VPS and for development;
+//   - an Object Storage bucket (OpenBucket): for Yandex Serverless Containers, where the local
+//     disk disappears with the instance and several instances may run at once.
+//
+// Concurrency between instances is optimistic: each save says which version it was based on
+// (If-Match on the object's ETag). If another instance saved first, the store reloads the latest
+// document, re-applies the change and tries again, so no member's review is silently lost.
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
-	"path/filepath"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -22,9 +29,18 @@ import (
 var (
 	ErrNotFound    = errors.New("not found")
 	ErrUnknownBook = errors.New("unknown book")
+
+	// errConflict: the stored document changed since we loaded it.
+	errConflict = errors.New("store: document changed concurrently")
+	// errNotModified: a conditional load found the document unchanged.
+	errNotModified = errors.New("store: not modified")
 )
 
-const currentVersion = 1
+const (
+	currentVersion  = 1
+	maxSaveAttempts = 5
+	ioTimeout       = 15 * time.Second
+)
 
 type Person struct {
 	ID   int64  `json:"id"`
@@ -80,58 +96,171 @@ func (s snapshot) clone() snapshot {
 	}
 }
 
-type FileStore struct {
-	path string
-	now  func() time.Time
-
-	mu   sync.RWMutex
-	data snapshot
+// backend persists the encoded document. version is an opaque token (an ETag for a bucket).
+type backend interface {
+	// load returns the document and its version. With ifNoneMatch set it may return
+	// errNotModified. A document that does not exist yet is fs.ErrNotExist.
+	load(ctx context.Context, ifNoneMatch string) (data []byte, version string, err error)
+	// save writes data if the stored version is still ifMatch ("" = must not exist yet),
+	// otherwise returns errConflict.
+	save(ctx context.Context, data []byte, ifMatch string) (version string, err error)
+	// shared reports whether other processes may write the same document.
+	shared() bool
+	// backup stores a copy of data under name if no copy with that name exists yet.
+	backup(ctx context.Context, name string, data []byte) error
 }
 
-// OpenFile loads path, or starts empty if it does not exist yet. The directory must exist.
-func OpenFile(path string) (*FileStore, error) {
-	s := &FileStore{path: path, now: time.Now, data: snapshot{Version: currentVersion}}
+type Store struct {
+	be  backend
+	log *slog.Logger
+	now func() time.Time
+	// refreshEvery: for a shared backend, how often reads check for changes made by others.
+	refreshEvery time.Duration
 
-	raw, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return s, nil
-	case err != nil:
-		return nil, fmt.Errorf("store: read %s: %w", path, err)
+	mu        sync.Mutex
+	data      snapshot
+	version   string
+	checkedAt time.Time
+	backupDay string // date of the last daily backup made by this process
+}
+
+func open(be backend, log *slog.Logger) (*Store, error) {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
 	}
-	if err := json.Unmarshal(raw, &s.data); err != nil {
-		return nil, fmt.Errorf("store: parse %s: %w", path, err)
+	s := &Store{be: be, log: log, now: time.Now, refreshEvery: 3 * time.Second, data: emptySnapshot()}
+	ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
+	defer cancel()
+	if err := s.reload(ctx, false); err != nil {
+		return nil, err
 	}
-	if s.data.Version > currentVersion {
-		return nil, fmt.Errorf("store: %s has data version %d, this build supports %d", path, s.data.Version, currentVersion)
-	}
-	s.data.Version = currentVersion
 	return s, nil
+}
+
+func emptySnapshot() snapshot { return snapshot{Version: currentVersion} }
+
+// reload replaces the in-memory data with the stored document. Caller holds s.mu (or owns s).
+func (s *Store) reload(ctx context.Context, conditional bool) error {
+	ifNoneMatch := ""
+	if conditional {
+		ifNoneMatch = s.version
+	}
+	raw, version, err := s.be.load(ctx, ifNoneMatch)
+	switch {
+	case errors.Is(err, errNotModified):
+		s.checkedAt = s.now()
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		s.data, s.version, s.checkedAt = emptySnapshot(), "", s.now()
+		return nil
+	case err != nil:
+		return err
+	}
+
+	var d snapshot
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return fmt.Errorf("store: parse: %w", err)
+	}
+	if d.Version > currentVersion {
+		return fmt.Errorf("store: data version %d is newer than this build supports (%d)", d.Version, currentVersion)
+	}
+	d.Version = currentVersion
+	s.data, s.version, s.checkedAt = d, version, s.now()
+	return nil
+}
+
+// current returns the latest data. For a shared backend it first checks, at most every
+// refreshEvery, whether another instance changed the document.
+func (s *Store) current() snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.be.shared() && s.now().Sub(s.checkedAt) >= s.refreshEvery {
+		ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
+		defer cancel()
+		if err := s.reload(ctx, true); err != nil {
+			// Showing data a few seconds old beats showing an error page.
+			s.log.Warn("store: refresh failed, serving cached data", "err", err)
+			s.checkedAt = s.now()
+		}
+	}
+	// Safe to share: mutate never changes these slices in place, it swaps in new ones.
+	return s.data
+}
+
+// mutate applies fn to a copy of the data and saves it. A failed fn or a failed save leaves the
+// store as it was. If another instance saved first, fn is re-applied to the fresh data.
+func (s *Store) mutate(fn func(d *snapshot) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
+	defer cancel()
+
+	for attempt := 1; ; attempt++ {
+		next := s.data.clone()
+		if err := fn(&next); err != nil {
+			return err
+		}
+		raw, err := json.MarshalIndent(next, "", "  ")
+		if err != nil {
+			return fmt.Errorf("store: encode: %w", err)
+		}
+
+		version, err := s.be.save(ctx, raw, s.version)
+		if errors.Is(err, errConflict) && attempt < maxSaveAttempts {
+			if err := s.reload(ctx, false); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+
+		prev := s.data
+		s.data, s.version, s.checkedAt = next, version, s.now()
+		s.dailyBackup(ctx, prev)
+		return nil
+	}
+}
+
+// dailyBackup keeps the state as it was before the first change of each day (UTC).
+// Failures are logged and never fail the user's change.
+func (s *Store) dailyBackup(ctx context.Context, before snapshot) {
+	day := s.now().UTC().Format(time.DateOnly)
+	if s.backupDay == day {
+		return
+	}
+	raw, err := json.MarshalIndent(before, "", "  ")
+	if err == nil {
+		err = s.be.backup(ctx, "backups/"+day+".json", raw)
+	}
+	if err != nil {
+		s.log.Warn("store: daily backup failed", "day", day, "err", err)
+		return
+	}
+	s.backupDay = day
 }
 
 // ---- books ----
 
 // Books returns all books, newest first.
-func (s *FileStore) Books() []Book {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := slices.Clone(s.data.Books)
+func (s *Store) Books() []Book {
+	out := slices.Clone(s.current().Books)
 	slices.SortStableFunc(out, func(a, b Book) int { return b.CreatedAt.Compare(a.CreatedAt) })
 	return out
 }
 
-func (s *FileStore) Book(id string) (Book, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	i := slices.IndexFunc(s.data.Books, func(b Book) bool { return b.ID == id })
+func (s *Store) Book(id string) (Book, error) {
+	books := s.current().Books
+	i := slices.IndexFunc(books, func(b Book) bool { return b.ID == id })
 	if i < 0 {
 		return Book{}, ErrNotFound
 	}
-	return s.data.Books[i], nil
+	return books[i], nil
 }
 
 // AddBook assigns ID and CreatedAt and saves the book.
-func (s *FileStore) AddBook(b Book) (Book, error) {
+func (s *Store) AddBook(b Book) (Book, error) {
 	b.ID = newID()
 	b.CreatedAt = s.now().UTC()
 	err := s.mutate(func(d *snapshot) error {
@@ -142,7 +271,7 @@ func (s *FileStore) AddBook(b Book) (Book, error) {
 }
 
 // DeleteBook removes the book with its reviews and unlinks it from meetings.
-func (s *FileStore) DeleteBook(id string) error {
+func (s *Store) DeleteBook(id string) error {
 	return s.mutate(func(d *snapshot) error {
 		i := slices.IndexFunc(d.Books, func(b Book) bool { return b.ID == id })
 		if i < 0 {
@@ -161,18 +290,14 @@ func (s *FileStore) DeleteBook(id string) error {
 
 // ---- reviews ----
 
-func (s *FileStore) AllReviews() []Review {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return slices.Clone(s.data.Reviews)
+func (s *Store) AllReviews() []Review {
+	return slices.Clone(s.current().Reviews)
 }
 
 // Reviews returns reviews of one book, most recently updated first.
-func (s *FileStore) Reviews(bookID string) []Review {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Store) Reviews(bookID string) []Review {
 	var out []Review
-	for _, r := range s.data.Reviews {
+	for _, r := range s.current().Reviews {
 		if r.BookID == bookID {
 			out = append(out, r)
 		}
@@ -181,19 +306,18 @@ func (s *FileStore) Reviews(bookID string) []Review {
 	return out
 }
 
-func (s *FileStore) Review(id string) (Review, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	i := slices.IndexFunc(s.data.Reviews, func(r Review) bool { return r.ID == id })
+func (s *Store) Review(id string) (Review, error) {
+	reviews := s.current().Reviews
+	i := slices.IndexFunc(reviews, func(r Review) bool { return r.ID == id })
 	if i < 0 {
 		return Review{}, ErrNotFound
 	}
-	return s.data.Reviews[i], nil
+	return reviews[i], nil
 }
 
 // UpsertReview creates the author's review of a book or updates the existing one.
 // Returns ErrNotFound if the book does not exist.
-func (s *FileStore) UpsertReview(bookID string, author Person, rating int, text string) (Review, error) {
+func (s *Store) UpsertReview(bookID string, author Person, rating int, text string) (Review, error) {
 	var out Review
 	err := s.mutate(func(d *snapshot) error {
 		if !slices.ContainsFunc(d.Books, func(b Book) bool { return b.ID == bookID }) {
@@ -214,7 +338,7 @@ func (s *FileStore) UpsertReview(bookID string, author Person, rating int, text 
 	return out, err
 }
 
-func (s *FileStore) DeleteReview(id string) error {
+func (s *Store) DeleteReview(id string) error {
 	return s.mutate(func(d *snapshot) error {
 		i := slices.IndexFunc(d.Reviews, func(r Review) bool { return r.ID == id })
 		if i < 0 {
@@ -228,26 +352,23 @@ func (s *FileStore) DeleteReview(id string) error {
 // ---- meetings ----
 
 // Meetings returns all meetings in chronological order.
-func (s *FileStore) Meetings() []Meeting {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := slices.Clone(s.data.Meetings)
+func (s *Store) Meetings() []Meeting {
+	out := slices.Clone(s.current().Meetings)
 	slices.SortStableFunc(out, func(a, b Meeting) int { return a.StartsAt.Compare(b.StartsAt) })
 	return out
 }
 
-func (s *FileStore) Meeting(id string) (Meeting, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	i := slices.IndexFunc(s.data.Meetings, func(m Meeting) bool { return m.ID == id })
+func (s *Store) Meeting(id string) (Meeting, error) {
+	meetings := s.current().Meetings
+	i := slices.IndexFunc(meetings, func(m Meeting) bool { return m.ID == id })
 	if i < 0 {
 		return Meeting{}, ErrNotFound
 	}
-	return s.data.Meetings[i], nil
+	return meetings[i], nil
 }
 
 // AddMeeting assigns ID and timestamps. Returns ErrUnknownBook if m.BookID is set but missing.
-func (s *FileStore) AddMeeting(m Meeting) (Meeting, error) {
+func (s *Store) AddMeeting(m Meeting) (Meeting, error) {
 	now := s.now().UTC()
 	m.ID, m.CreatedAt, m.UpdatedAt = newID(), now, now
 	err := s.mutate(func(d *snapshot) error {
@@ -261,7 +382,7 @@ func (s *FileStore) AddMeeting(m Meeting) (Meeting, error) {
 }
 
 // UpdateMeeting replaces the editable fields of meeting m.ID; author and creation time are kept.
-func (s *FileStore) UpdateMeeting(m Meeting) (Meeting, error) {
+func (s *Store) UpdateMeeting(m Meeting) (Meeting, error) {
 	var out Meeting
 	err := s.mutate(func(d *snapshot) error {
 		i := slices.IndexFunc(d.Meetings, func(x Meeting) bool { return x.ID == m.ID })
@@ -280,7 +401,7 @@ func (s *FileStore) UpdateMeeting(m Meeting) (Meeting, error) {
 	return out, err
 }
 
-func (s *FileStore) DeleteMeeting(id string) error {
+func (s *Store) DeleteMeeting(id string) error {
 	return s.mutate(func(d *snapshot) error {
 		i := slices.IndexFunc(d.Meetings, func(m Meeting) bool { return m.ID == id })
 		if i < 0 {
@@ -294,55 +415,6 @@ func (s *FileStore) DeleteMeeting(id string) error {
 func checkBook(d *snapshot, bookID string) error {
 	if bookID != "" && !slices.ContainsFunc(d.Books, func(b Book) bool { return b.ID == bookID }) {
 		return ErrUnknownBook
-	}
-	return nil
-}
-
-// ---- persistence ----
-
-// mutate applies fn to a copy, writes the copy to disk and only then makes it current.
-// A failed fn or a failed write leaves both memory and file untouched.
-func (s *FileStore) mutate(fn func(d *snapshot) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	next := s.data.clone()
-	if err := fn(&next); err != nil {
-		return err
-	}
-	if err := s.persist(next); err != nil {
-		return err
-	}
-	s.data = next
-	return nil
-}
-
-func (s *FileStore) persist(d snapshot) error {
-	raw, err := json.MarshalIndent(d, "", "  ")
-	if err != nil {
-		return fmt.Errorf("store: encode: %w", err)
-	}
-
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".bookclub-*.tmp") // created with 0600
-	if err != nil {
-		return fmt.Errorf("store: persist: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename has succeeded
-
-	if _, err := tmp.Write(raw); err != nil {
-		tmp.Close()
-		return fmt.Errorf("store: persist: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("store: persist: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("store: persist: %w", err)
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("store: persist: %w", err)
 	}
 	return nil
 }

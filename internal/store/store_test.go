@@ -13,7 +13,7 @@ var (
 	olga = Person{ID: 2, Name: "Ольга"}
 )
 
-func open(t *testing.T) (*FileStore, string) {
+func openTemp(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "data.json")
 	s, err := OpenFile(path)
@@ -36,7 +36,7 @@ func must[T any](t *testing.T) func(T, error) T {
 }
 
 func TestBooksAndReviews(t *testing.T) {
-	s, path := open(t)
+	s, path := openTemp(t)
 
 	first := must[Book](t)(s.AddBook(Book{Title: "Мастер и Маргарита", AddedBy: anna}))
 	second := must[Book](t)(s.AddBook(Book{Title: "Обломов", AddedBy: olga}))
@@ -70,7 +70,7 @@ func TestBooksAndReviews(t *testing.T) {
 }
 
 func TestDeleteBookCascades(t *testing.T) {
-	s, _ := open(t)
+	s, _ := openTemp(t)
 	b := must[Book](t)(s.AddBook(Book{Title: "Война и мир", AddedBy: anna}))
 	must[Review](t)(s.UpsertReview(b.ID, olga, 5, ""))
 	m := must[Meeting](t)(s.AddMeeting(Meeting{StartsAt: time.Now(), BookID: b.ID, CreatedBy: anna}))
@@ -90,7 +90,7 @@ func TestDeleteBookCascades(t *testing.T) {
 }
 
 func TestMeetings(t *testing.T) {
-	s, _ := open(t)
+	s, _ := openTemp(t)
 	late := must[Meeting](t)(s.AddMeeting(Meeting{StartsAt: time.Date(2026, 12, 1, 18, 0, 0, 0, time.UTC), CreatedBy: anna}))
 	early := must[Meeting](t)(s.AddMeeting(Meeting{StartsAt: time.Date(2026, 11, 1, 18, 0, 0, 0, time.UTC), CreatedBy: anna}))
 
@@ -112,7 +112,7 @@ func TestMeetings(t *testing.T) {
 }
 
 func TestFailedWriteLeavesStateUntouched(t *testing.T) {
-	s, path := open(t)
+	s, path := openTemp(t)
 	must[Book](t)(s.AddBook(Book{Title: "Первая", AddedBy: anna}))
 
 	if os.Getuid() == 0 {

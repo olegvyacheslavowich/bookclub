@@ -1,4 +1,5 @@
 /data/
+/dist/
 /bookclub
 *.tmp
 .env

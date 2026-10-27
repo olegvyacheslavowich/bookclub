@@ -23,6 +23,10 @@ import (
 type config struct {
 	addr       string
 	dataFile   string
+	bucket     string // Object Storage bucket; when set, DATA_FILE is ignored
+	bucketKey  string
+	endpoint   string // S3 endpoint override, e.g. a local MinIO; default Yandex Object Storage
+	iamToken   string // fixed IAM token for running locally against a real bucket
 	botToken   string
 	chatID     string
 	devMode    bool
@@ -31,8 +35,12 @@ type config struct {
 
 func loadConfig() (config, error) {
 	c := config{
-		addr:       env("ADDR", ":8080"),
+		addr:       listenAddr(),
 		dataFile:   env("DATA_FILE", "data/bookclub.json"),
+		bucket:     os.Getenv("DATA_BUCKET"),
+		bucketKey:  env("DATA_KEY", "bookclub.json"),
+		endpoint:   os.Getenv("DATA_ENDPOINT"),
+		iamToken:   os.Getenv("YC_IAM_TOKEN"),
 		botToken:   os.Getenv("BOT_TOKEN"),
 		chatID:     os.Getenv("CLUB_CHAT_ID"),
 		devMode:    os.Getenv("DEV_MODE") == "1",
@@ -56,6 +64,17 @@ func loadConfig() (config, error) {
 	return c, nil
 }
 
+// listenAddr: ADDR wins; otherwise PORT, which Yandex Serverless Containers set for the app.
+func listenAddr() string {
+	if v := os.Getenv("ADDR"); v != "" {
+		return v
+	}
+	if p := os.Getenv("PORT"); p != "" {
+		return ":" + p
+	}
+	return ":8080"
+}
+
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -77,10 +96,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(cfg.dataFile), 0o700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
-	st, err := store.OpenFile(cfg.dataFile)
+	st, where, err := openStore(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -118,7 +134,7 @@ func run(log *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", cfg.addr, "data", cfg.dataFile)
+		log.Info("listening", "addr", cfg.addr, "data", where)
 		errCh <- httpSrv.ListenAndServe()
 	}()
 
@@ -135,4 +151,21 @@ func run(log *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(shutdownCtx)
+}
+
+func openStore(cfg config, log *slog.Logger) (*store.Store, string, error) {
+	if cfg.bucket != "" {
+		var token store.TokenSource = &store.MetadataToken{}
+		if cfg.iamToken != "" {
+			token = store.StaticToken(cfg.iamToken)
+		}
+		st, err := store.OpenBucket(store.BucketConfig{Bucket: cfg.bucket, Key: cfg.bucketKey, Endpoint: cfg.endpoint, Token: token, Logger: log})
+		return st, "bucket " + cfg.bucket + "/" + cfg.bucketKey, err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cfg.dataFile), 0o700); err != nil {
+		return nil, "", fmt.Errorf("create data dir: %w", err)
+	}
+	st, err := store.OpenFile(cfg.dataFile)
+	return st, cfg.dataFile, err
 }
