@@ -74,7 +74,9 @@ IMAGE="registry.yandexcloud.net/$REGISTRY_ID/$APP:$TAG"
 
 step "Сборка $IMAGE"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/bookclub ./cmd/bookclub
-docker build --platform linux/amd64 -t "$IMAGE" .
+# Plain image manifest: Docker Desktop otherwise adds provenance/SBOM attestations,
+# which turn the push into an image index the registry may reject.
+docker build --platform linux/amd64 --provenance=false --sbom=false -t "$IMAGE" .
 docker push "$IMAGE"
 
 step "Контейнер $CONTAINER"

@@ -138,7 +138,7 @@ club.example.ru {
 Или в Docker (после сборки бинарника):
 
 ```bash
-docker build --platform linux/amd64 -t bookclub .
+docker build --platform linux/amd64 --provenance=false --sbom=false -t bookclub .
 docker run -d --restart unless-stopped -p 127.0.0.1:8080:8080 \
   -v bookclub-data:/home/nonroot/data \
   -e BOT_TOKEN=... -e CLUB_CHAT_ID=... \
