@@ -79,7 +79,7 @@ func (h *harness) do(who, method, path, body string, out any) int {
 	}
 	req, _ := http.NewRequest(method, h.srv.URL+path, rd)
 	if who != "" {
-		req.Header.Set("Authorization", "tma "+who)
+		req.Header.Set(AuthHeader, "tma "+who)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -286,5 +286,19 @@ func TestLink(t *testing.T) {
 		if _, err := link(in); err == nil {
 			t.Errorf("link(%q) must fail", in)
 		}
+	}
+}
+
+func TestAuthorizationHeaderFallback(t *testing.T) {
+	h := newHarness(t)
+	req, _ := http.NewRequest("GET", h.srv.URL+"/api/me", nil)
+	req.Header.Set("Authorization", "tma "+olga)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Authorization header must still work, got %d", resp.StatusCode)
 	}
 }

@@ -163,7 +163,13 @@ func (s *Server) withUser(h userHandler) http.Handler {
 
 // authenticate reads "Authorization: tma <initData>" (or "dev <id>:<name>" in dev mode).
 func (s *Server) authenticate(r *http.Request) (u store.Person, dev bool, err error) {
-	scheme, value, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	// Yandex Serverless Containers take the Authorization header for their own IAM check and
+	// don't pass it to the app, so the front end sends credentials in AuthHeader instead.
+	raw := r.Header.Get(AuthHeader)
+	if raw == "" {
+		raw = r.Header.Get("Authorization")
+	}
+	scheme, value, _ := strings.Cut(raw, " ")
 	switch {
 	case scheme == "tma":
 		tu, err := s.auth.Validate(value)
@@ -209,6 +215,9 @@ func (s *Server) authReason(err error) string {
 		return "Техническая причина: " + err.Error()
 	}
 }
+
+// AuthHeader carries "tma <initData>" (or "dev <id>:<name>" in dev mode).
+const AuthHeader = "X-Telegram-Auth"
 
 type authError string
 

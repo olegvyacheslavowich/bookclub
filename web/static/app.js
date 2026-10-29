@@ -55,7 +55,8 @@
 
   async function api(method, path, body) {
     // Header values must be Latin-1, so the dev user (usually Cyrillic) is percent-encoded.
-    const headers = { Authorization: inTelegram ? 'tma ' + tg.initData : 'dev ' + encodeURIComponent(devUser) };
+    // Not Authorization: Yandex Serverless Containers consume that header and don't pass it on.
+    const headers = { 'X-Telegram-Auth': inTelegram ? 'tma ' + tg.initData : 'dev ' + encodeURIComponent(devUser) };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
     let res;
