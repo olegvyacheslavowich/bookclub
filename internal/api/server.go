@@ -145,7 +145,11 @@ func (s *Server) withUser(h userHandler) http.Handler {
 			ok, err := s.members.IsMember(r.Context(), u.ID)
 			if err != nil {
 				s.log.Error("membership check failed", "user", u.ID, "err", err)
-				writeError(w, http.StatusServiceUnavailable, "Не получилось проверить участие в клубе. Попробуйте через минуту.")
+				// err is Telegram's own description or a network error; the bot token is never in it.
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error":  "Не получилось проверить участие в клубе. Попробуйте через минуту.",
+					"reason": "Техническая причина: " + err.Error(),
+				})
 				return
 			}
 			if !ok {
