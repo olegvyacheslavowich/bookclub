@@ -46,9 +46,10 @@
   // ---------------------------------------------------------------- API
 
   class ApiError extends Error {
-    constructor(status, message) {
+    constructor(status, message, reason) {
       super(message);
       this.status = status;
+      this.reason = reason || '';
     }
   }
 
@@ -67,7 +68,7 @@
 
     let data = null;
     try { data = await res.json(); } catch (_) { /* not JSON */ }
-    if (!res.ok) throw new ApiError(res.status, (data && data.error) || 'Что-то пошло не так. Попробуйте ещё раз.');
+    if (!res.ok) throw new ApiError(res.status, (data && data.error) || 'Что-то пошло не так. Попробуйте ещё раз.', data && data.reason);
     return data;
   }
 
@@ -141,6 +142,10 @@
     return h('div', { class: 'card empty' },
       h('div', { class: 'empty-title' }, 'Не получилось'),
       h('p', null, msg),
+      err.reason && h('p', { class: 'hint small diag' }, err.reason),
+      // Field names only (no values): enough to see what Telegram actually sent.
+      err.status === 401 && inTelegram && h('p', { class: 'hint small diag' },
+        'Поля от Telegram: ' + [...new URLSearchParams(tg.initData).keys()].join(', ')),
       err.status !== 403 && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => refresh() }, 'Попробовать ещё раз'));
   }
 

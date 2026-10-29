@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -49,6 +50,7 @@ type Config struct {
 	Store   Store
 	Auth    Authenticator
 	Members MemberChecker // nil disables the club membership check
+	BotID   string        // numeric bot ID (token prefix), shown in auth error reasons
 	DevMode bool          // accept "Authorization: dev <id>:<name>"; never enable in production
 	Static  fs.FS
 	Logger  *slog.Logger
@@ -59,6 +61,7 @@ type Server struct {
 	auth    Authenticator
 	members MemberChecker
 	devMode bool
+	botID   string
 	static  fs.FS
 	log     *slog.Logger
 
@@ -75,6 +78,7 @@ func New(cfg Config) *Server {
 		auth:    cfg.Auth,
 		members: cfg.Members,
 		devMode: cfg.DevMode,
+		botID:   cfg.BotID,
 		static:  cfg.Static,
 		log:     logger,
 	}
@@ -128,7 +132,12 @@ func (s *Server) withUser(h userHandler) http.Handler {
 		u, dev, err := s.authenticate(r)
 		if err != nil {
 			s.log.Info("auth rejected", "path", r.URL.Path, "err", err)
-			writeError(w, http.StatusUnauthorized, "Не удалось подтвердить вход. Закройте приложение и откройте его заново из Telegram.")
+			// The reason is shown under the error so problems can be diagnosed without server logs.
+			// It never contains secrets: at most the bot's numeric ID, which is public.
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error":  "Не удалось подтвердить вход. Закройте приложение и откройте его заново из Telegram.",
+				"reason": s.authReason(err),
+			})
 			return
 		}
 
@@ -180,6 +189,24 @@ func (s *Server) authenticate(r *http.Request) (u store.Person, dev bool, err er
 
 	default:
 		return store.Person{}, false, errNoCredentials
+	}
+}
+
+func (s *Server) authReason(err error) string {
+	switch {
+	case errors.Is(err, auth.ErrBadHash):
+		return "Подпись Telegram не совпала с токеном на сервере (бот ID " + s.botID + "). " +
+			"Приложение должно быть создано через /newapp у этого же бота, а в BOT_TOKEN — его токен."
+	case errors.Is(err, auth.ErrExpired):
+		return "Данные входа устарели. Закройте приложение крестиком и откройте снова."
+	case errors.Is(err, auth.ErrMissingHash):
+		return "Telegram не передал подпись (hash)."
+	case errors.Is(err, auth.ErrNoUser):
+		return "Telegram не передал данные пользователя."
+	case errors.Is(err, errNoCredentials):
+		return "Запрос пришёл без данных входа Telegram."
+	default:
+		return "Техническая причина: " + err.Error()
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -116,6 +117,7 @@ func run(log *slog.Logger) error {
 		Auth:    auth.NewValidator(cfg.botToken, cfg.initMaxAge),
 		Members: members,
 		DevMode: cfg.devMode,
+		BotID:   botID(cfg.botToken),
 		Static:  web.FS(),
 		Logger:  log,
 	})
@@ -168,4 +170,10 @@ func openStore(cfg config, log *slog.Logger) (*store.Store, string, error) {
 	}
 	st, err := store.OpenFile(cfg.dataFile)
 	return st, cfg.dataFile, err
+}
+
+// botID is the public numeric part of a bot token ("123456:ABC" -> "123456").
+func botID(token string) string {
+	id, _, _ := strings.Cut(token, ":")
+	return id
 }

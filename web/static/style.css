@@ -117,6 +117,7 @@ h1, h2, p { margin: 0; }
 .empty-title { margin-bottom: 8px; font-size: 20px; font-weight: 600; }
 .empty p { margin-bottom: 16px; }
 .empty p:last-child { margin-bottom: 0; }
+.empty .diag { text-align: left; overflow-wrap: anywhere; }
 
 .badge {
   display: inline-block;
