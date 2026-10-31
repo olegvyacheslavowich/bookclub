@@ -48,22 +48,30 @@ type Person struct {
 }
 
 type Book struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Author    string    `json:"author,omitempty"`
-	Link      string    `json:"link,omitempty"`
-	Note      string    `json:"note,omitempty"`
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Author string `json:"author,omitempty"`
+	Link   string `json:"link,omitempty"`
+	Note   string `json:"note,omitempty"`
+	// Cover is the file name of the cover photo in the covers storage (Yandex Disk); empty: none.
+	Cover string `json:"cover,omitempty"`
+	// CoverLink is the cover's public link on Yandex Disk, for link previews; empty: not published.
+	CoverLink string    `json:"coverLink,omitempty"`
 	AddedBy   Person    `json:"addedBy"`
 	CreatedAt time.Time `json:"createdAt"`
 }
 
 // Review: one per (book, author); posting again updates it.
 type Review struct {
-	ID        string    `json:"id"`
-	BookID    string    `json:"bookId"`
-	Author    Person    `json:"author"`
-	Rating    int       `json:"rating"`
-	Text      string    `json:"text,omitempty"`
+	ID     string `json:"id"`
+	BookID string `json:"bookId"`
+	Author Person `json:"author"`
+	Rating int    `json:"rating"`
+	Text   string `json:"text,omitempty"`
+	// Photo is the file name of the review's photo in the photo storage; empty: none.
+	Photo string `json:"photo,omitempty"`
+	// PhotoLink is the photo's public link on Yandex Disk, for link previews; empty: not published.
+	PhotoLink string    `json:"photoLink,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -187,6 +195,45 @@ func (s *Store) current() snapshot {
 	return s.data
 }
 
+// fresh checks the shared document right away, ignoring refreshEvery. Used when something is
+// missing: it may have just been added through another instance — e.g. a member adds a book on
+// one instance and the next request, for that book's page, lands on another. Returns whether
+// the data changed.
+func (s *Store) fresh() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshLocked()
+}
+
+// refreshLocked is fresh for a caller holding s.mu.
+func (s *Store) refreshLocked() bool {
+	if !s.be.shared() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
+	defer cancel()
+	before := s.version
+	if err := s.reload(ctx, true); err != nil {
+		s.log.Warn("store: refresh failed", "err", err)
+		return false
+	}
+	return s.version != before
+}
+
+// lookup finds an item in the current data; on a miss it re-checks the shared document once.
+func lookup[T any](s *Store, items func(snapshot) []T, match func(T) bool) (T, error) {
+	for attempt := 0; ; attempt++ {
+		list := items(s.current())
+		if i := slices.IndexFunc(list, match); i >= 0 {
+			return list[i], nil
+		}
+		if attempt > 0 || !s.fresh() {
+			var zero T
+			return zero, ErrNotFound
+		}
+	}
+}
+
 // mutate applies fn to a copy of the data and saves it. A failed fn or a failed save leaves the
 // store as it was. If another instance saved first, fn is re-applied to the fresh data.
 func (s *Store) mutate(fn func(d *snapshot) error) error {
@@ -195,9 +242,15 @@ func (s *Store) mutate(fn func(d *snapshot) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), ioTimeout)
 	defer cancel()
 
+	refreshed := false
 	for attempt := 1; ; attempt++ {
 		next := s.data.clone()
 		if err := fn(&next); err != nil {
+			// "Not found" may come from stale data: re-check once and re-apply if anything changed.
+			if !refreshed && s.refreshLocked() {
+				refreshed = true
+				continue
+			}
 			return err
 		}
 		raw, err := json.MarshalIndent(next, "", "  ")
@@ -251,12 +304,7 @@ func (s *Store) Books() []Book {
 }
 
 func (s *Store) Book(id string) (Book, error) {
-	books := s.current().Books
-	i := slices.IndexFunc(books, func(b Book) bool { return b.ID == id })
-	if i < 0 {
-		return Book{}, ErrNotFound
-	}
-	return books[i], nil
+	return lookup(s, func(d snapshot) []Book { return d.Books }, func(b Book) bool { return b.ID == id })
 }
 
 // AddBook assigns ID and CreatedAt and saves the book.
@@ -268,6 +316,21 @@ func (s *Store) AddBook(b Book) (Book, error) {
 		return nil
 	})
 	return b, err
+}
+
+// SetCover sets (or, with cover == "", removes) the book's cover photo and returns the previous
+// one, so the caller can delete its file. Returns ErrNotFound if the book does not exist.
+func (s *Store) SetCover(bookID, cover string) (old string, err error) {
+	err = s.mutate(func(d *snapshot) error {
+		i := slices.IndexFunc(d.Books, func(b Book) bool { return b.ID == bookID })
+		if i < 0 {
+			return ErrNotFound
+		}
+		old = d.Books[i].Cover
+		d.Books[i].Cover, d.Books[i].CoverLink = cover, ""
+		return nil
+	})
+	return old, err
 }
 
 // DeleteBook removes the book with its reviews and unlinks it from meetings.
@@ -307,15 +370,48 @@ func (s *Store) Reviews(bookID string) []Review {
 }
 
 func (s *Store) Review(id string) (Review, error) {
-	reviews := s.current().Reviews
-	i := slices.IndexFunc(reviews, func(r Review) bool { return r.ID == id })
-	if i < 0 {
-		return Review{}, ErrNotFound
-	}
-	return reviews[i], nil
+	return lookup(s, func(d snapshot) []Review { return d.Reviews }, func(r Review) bool { return r.ID == id })
 }
 
-// UpsertReview creates the author's review of a book or updates the existing one.
+// SetReviewPhoto sets (or, with photo == "", removes) the review's photo and returns the previous
+// one, so the caller can delete its file. UpdatedAt is left alone: a photo isn't an edit of the
+// text. Returns ErrNotFound if the review does not exist.
+func (s *Store) SetReviewPhoto(reviewID, photo string) (old string, err error) {
+	err = s.mutate(func(d *snapshot) error {
+		i := slices.IndexFunc(d.Reviews, func(r Review) bool { return r.ID == reviewID })
+		if i < 0 {
+			return ErrNotFound
+		}
+		old = d.Reviews[i].Photo
+		d.Reviews[i].Photo, d.Reviews[i].PhotoLink = photo, ""
+		return nil
+	})
+	return old, err
+}
+
+// SetPhotoLink remembers the public link of a photo file: the cover of a book or the photo of a
+// review, whichever still uses that file. Returns ErrNotFound if none does (it was replaced).
+func (s *Store) SetPhotoLink(file, link string) error {
+	return s.mutate(func(d *snapshot) error {
+		found := false
+		for i := range d.Books {
+			if d.Books[i].Cover == file {
+				d.Books[i].CoverLink, found = link, true
+			}
+		}
+		for i := range d.Reviews {
+			if d.Reviews[i].Photo == file {
+				d.Reviews[i].PhotoLink, found = link, true
+			}
+		}
+		if !found {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// UpsertReview creates the author's review of a book or updates the existing one (its photo stays).
 // Returns ErrNotFound if the book does not exist.
 func (s *Store) UpsertReview(bookID string, author Person, rating int, text string) (Review, error) {
 	var out Review
@@ -359,12 +455,7 @@ func (s *Store) Meetings() []Meeting {
 }
 
 func (s *Store) Meeting(id string) (Meeting, error) {
-	meetings := s.current().Meetings
-	i := slices.IndexFunc(meetings, func(m Meeting) bool { return m.ID == id })
-	if i < 0 {
-		return Meeting{}, ErrNotFound
-	}
-	return meetings[i], nil
+	return lookup(s, func(d snapshot) []Meeting { return d.Meetings }, func(m Meeting) bool { return m.ID == id })
 }
 
 // AddMeeting assigns ID and timestamps. Returns ErrUnknownBook if m.BookID is set but missing.

@@ -14,7 +14,7 @@
   const $footer = document.getElementById('footer');
   const $toast = document.getElementById('toast');
 
-  let me = null;      // { id, name }
+  let me = null;      // { id, name, appUrl, isAdmin, canManageMeetings, covers }
   let renderSeq = 0;  // bumps on every navigation; late async results for old screens are dropped
 
   // ---------------------------------------------------------------- Telegram helpers
@@ -39,6 +39,56 @@
     else window.open(url, '_blank', 'noopener');
   }
 
+  // ---------------------------------------------------------------- sharing to the club's group
+  // t.me/share/url opens Telegram's chat picker with the message filled in; the member picks the
+  // club's group and sends it as themselves. It goes through the member's own Telegram, so it works
+  // even though our server can't reach the Bot API from Yandex Cloud.
+  // It carries only text and a link, so a photo can't be attached. When a review (or its book) has
+  // a photo, the link goes to our public page /s/<token> instead, and Telegram shows the photo as
+  // the link's preview (see internal/api/share.go).
+
+  const SHARE_TEXT_MAX = 1500; // long texts make the share link too long for some clients
+
+  const canShare = () => !!(me && me.appUrl);
+
+  function cut(str, max) {
+    const chars = Array.from(str); // by code points, so an emoji is never split in half
+    return chars.length > max ? chars.slice(0, max).join('').trimEnd() + '…' : str;
+  }
+
+  const bookLine = (b) => `«${b.title}»` + (b.author ? ` — ${b.author}` : '');
+  const starLine = (n) => '★'.repeat(n) + '☆'.repeat(5 - n) + ` ${n} из 5`;
+
+  // The link opens the Mini App right on the book (the front end reads start_param, see login()).
+  // previewPath: the server's page with a photo preview, relative to the app. It goes first, so
+  // Telegram builds the preview from it. It can't take the member into the app: opened from a
+  // browser, the app doesn't know the member came from the club's group and refuses access. So the
+  // Mini App link goes into the text as well, and members open the app by it, from the group.
+  function shareToGroup(text, bookId, previewPath) {
+    const appLink = new URL(me.appUrl);
+    appLink.searchParams.set('startapp', 'book_' + bookId);
+    let link = appLink;
+    if (previewPath) {
+      link = new URL(previewPath, location.href);
+      text += '\n\nОткрыть в приложении: ' + appLink.toString();
+    }
+    const url = 'https://t.me/share/url?url=' + encodeURIComponent(link.toString()) + '&text=' + encodeURIComponent(text);
+    if (inTelegram && supports('6.1')) tg.openTelegramLink(url);
+    else window.open(url, '_blank', 'noopener');
+  }
+
+  function shareBook(b) {
+    let text = (b.mine ? '📚 Предлагаю почитать: ' : '📚 ') + bookLine(b);
+    if (b.note) text += '\n\n' + cut(b.note, SHARE_TEXT_MAX);
+    shareToGroup(text, b.id);
+  }
+
+  function shareReview(book, review) {
+    let text = `✍️ Мой отзыв на ${bookLine(book)}\n${starLine(review.rating)}`;
+    if (review.text) text += '\n\n' + cut(review.text, SHARE_TEXT_MAX);
+    shareToGroup(text, book.id, review.shareUrl); // the review's photo, else the cover, in the preview
+  }
+
   function syncColorScheme() {
     if (tg && tg.colorScheme) document.documentElement.style.colorScheme = tg.colorScheme;
   }
@@ -53,15 +103,25 @@
     }
   }
 
+  // Header values must be Latin-1, so the dev user (usually Cyrillic) is percent-encoded.
+  // Not Authorization: Yandex Serverless Containers consume that header and don't pass it on.
+  const authHeaders = () => ({ 'X-Telegram-Auth': inTelegram ? 'tma ' + tg.initData : 'dev ' + encodeURIComponent(devUser) });
+
+  // body: an object (sent as JSON) or a Blob (sent as is, e.g. a photo).
   async function api(method, path, body) {
-    // Header values must be Latin-1, so the dev user (usually Cyrillic) is percent-encoded.
-    // Not Authorization: Yandex Serverless Containers consume that header and don't pass it on.
-    const headers = { 'X-Telegram-Auth': inTelegram ? 'tma ' + tg.initData : 'dev ' + encodeURIComponent(devUser) };
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const headers = authHeaders();
+    let payload;
+    if (body instanceof Blob) {
+      headers['Content-Type'] = body.type || 'application/octet-stream';
+      payload = body;
+    } else if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body);
+    }
 
     let res;
     try {
-      res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      res = await fetch(path, { method, headers, body: payload });
     } catch (_) {
       throw new ApiError(0, 'Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.');
     }
@@ -147,7 +207,12 @@
       // Field names only (no values): enough to see what Telegram actually sent.
       err.status === 401 && inTelegram && h('p', { class: 'hint small diag' },
         'Поля от Telegram: ' + [...new URLSearchParams(tg.initData).keys()].join(', ')),
-      err.status !== 403 && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => refresh() }, 'Попробовать ещё раз'));
+      // Not found: the item is gone, retrying won't bring it back — offer the list instead.
+      err.status === 404 && h('button', {
+        type: 'button', class: 'btn btn-secondary',
+        onclick: () => location.replace(location.hash.startsWith('#/meetings') ? '#/meetings' : '#/books'),
+      }, 'К списку'),
+      err.status !== 403 && err.status !== 404 && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => refresh() }, 'Попробовать ещё раз'));
   }
 
   // Shows "Загрузка…" only if loading takes a moment, so fast screens don't flicker.
@@ -210,6 +275,114 @@
   }
 
   const isUrl = (s) => /^https?:\/\/\S+$/i.test(s);
+
+  // ---------------------------------------------------------------- cover photos
+  // Photos live on the club owner's Yandex Disk; the server hands them out only to members, so an
+  // <img src> (which can't carry the Telegram credentials) won't do. Each cover is fetched once with
+  // the credentials and shown from a blob: URL. The URL changes with every new photo (?v=…), so the
+  // browser may cache it for good.
+
+  const coverCache = new Map(); // cover URL -> Promise of a blob: URL
+
+  function loadCover(url) {
+    if (!coverCache.has(url)) {
+      const p = fetch(url, { headers: authHeaders() })
+        .then((res) => { if (!res.ok) throw new Error('HTTP ' + res.status); return res.blob(); })
+        .then((blob) => URL.createObjectURL(blob));
+      p.catch(() => coverCache.delete(url)); // let the next screen try again
+      coverCache.set(url, p);
+    }
+    return coverCache.get(url);
+  }
+
+  // cover(url, cls): a frame with the photo; without url, an empty frame with a book icon.
+  // lazy: start loading only when the frame is about to scroll into view (long lists).
+  // alt: what the photo is; a book cover by default (review photos use the same frame).
+  function cover(url, cls, lazy, alt) {
+    const frame = h('div', { class: 'cover ' + (cls || '') + (url ? '' : ' cover-none'), 'aria-hidden': url ? null : 'true' });
+    if (!url) return frame;
+    const img = h('img', { alt: alt || 'Фото обложки', decoding: 'async' });
+    frame.append(img);
+    const show = () => loadCover(url).then(
+      (src) => { img.src = src; frame.classList.add('loaded'); },
+      () => frame.classList.add('cover-none'));
+    if (lazy && 'IntersectionObserver' in window) {
+      const io = new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting)) { io.disconnect(); show(); }
+      }, { rootMargin: '400px 0px' });
+      io.observe(frame);
+    } else {
+      show();
+    }
+    return frame;
+  }
+
+  const PHOTO_MAX_SIDE = 1280;
+  const PHOTO_QUALITY = 0.85;
+
+  async function decodeImage(file) {
+    if (window.createImageBitmap) {
+      try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (_) { /* older Safari: no options */ }
+    }
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('decode'));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // A phone photo is 3–10 MB. Shrinks it to at most 1280 px on the long side as JPEG — about
+  // 150–300 KB, enough for a cover and quick on mobile internet. Re-encoding also drops the photo's
+  // metadata, including where it was taken.
+  async function preparePhoto(file) {
+    let img;
+    try {
+      img = await decodeImage(file);
+    } catch (_) {
+      throw new Error('Не получилось открыть это фото. Выберите другое или сделайте снимок камерой.');
+    }
+    const w = img.naturalWidth || img.width;
+    const hgt = img.naturalHeight || img.height;
+    const scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(w, hgt));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(hgt * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; // transparent PNGs would turn black in JPEG
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    if (img.close) img.close();
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', PHOTO_QUALITY));
+    if (!blob) throw new Error('Не получилось подготовить фото. Попробуйте другое.');
+    return blob;
+  }
+
+  async function uploadCover(bookId, blob) {
+    const res = await api('PUT', `api/books/${bookId}/cover`, blob);
+    // We already have the bytes: show them right away instead of downloading them back.
+    coverCache.set(res.coverUrl, Promise.resolve(URL.createObjectURL(blob)));
+    return res;
+  }
+
+  async function uploadReviewPhoto(reviewId, blob) {
+    const res = await api('PUT', `api/reviews/${reviewId}/photo`, blob);
+    coverCache.set(res.photoUrl, Promise.resolve(URL.createObjectURL(blob)));
+    return res;
+  }
+
+  // photoPicker(onPick): a hidden file input. On phones it offers the camera or the gallery.
+  function photoPicker(onPick) {
+    const input = h('input', {
+      type: 'file', accept: 'image/*', hidden: true,
+      onchange: () => {
+        const file = input.files && input.files[0];
+        input.value = ''; // picking the same photo again must fire change too
+        if (file) onPick(file);
+      },
+    });
+    return input;
+  }
 
   // ---------------------------------------------------------------- stars
 
@@ -308,7 +481,9 @@
         return [add, empty('Пока нет ни одной книги', 'Нажмите «Добавить книгу» — и она появится здесь для всего клуба.')];
       }
 
-      const items = books.map((b) => ({ el: bookCard(b), key: normalize(`${b.title} ${b.author || ''}`) }));
+      // Thumbnails once any book has a photo; then books without one get an empty frame, so titles line up.
+      const withCovers = books.some((b) => b.coverUrl);
+      const items = books.map((b) => ({ el: bookCard(b, withCovers), key: normalize(`${b.title} ${b.author || ''}`) }));
       const title = h('h2', { class: 'section-title' });
       const nothing = h('div', { class: 'card empty', hidden: true },
         h('div', { class: 'empty-title' }, 'Ничего не нашлось'),
@@ -345,8 +520,8 @@
     });
   }
 
-  function bookCard(b) {
-    return h('a', { class: 'card book-card', href: '#/books/' + b.id },
+  function bookCard(b, withCover) {
+    const text = h('div', { class: 'book-card-text' },
       h('div', { class: 'book-title' }, b.title),
       b.author && h('div', { class: 'book-author' }, b.author),
       h('div', { class: 'book-meta' },
@@ -354,6 +529,9 @@
           ? [stars(b.rating.average), h('span', null, `${fmtAvg(b.rating.average)} · ${reviewsWord(b.rating.count)}`)]
           : h('span', { class: 'hint' }, 'Пока нет отзывов')),
       b.myRating && h('div', { class: 'my-mark' }, `Ваша оценка: ${b.myRating} из 5`));
+    return h('a', { class: 'card book-card' + (withCover ? ' with-cover' : ''), href: '#/books/' + b.id },
+      withCover && cover(b.coverUrl, 'cover-thumb', true),
+      text);
   }
 
   function renderAddBook() {
@@ -363,6 +541,32 @@
     const note = h('textarea', { rows: 3, maxlength: 1000, placeholder: 'Например: о чём книга или почему стоит прочитать' });
     const err = errorLine();
     const submit = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Добавить книгу');
+
+    // The photo is prepared (shrunk) as soon as it's picked and uploaded after the book is saved.
+    let photo = null;
+    let preparing = null; // Promise while a picked photo is being shrunk
+    const photoBox = h('div', { class: 'photo-field' });
+    const picker = photoPicker((file) => {
+      err.hide();
+      preparing = preparePhoto(file).then((blob) => {
+        photo = blob;
+        paintPhoto();
+      }, (ex) => {
+        err.show(ex.message);
+      }).finally(() => { preparing = null; });
+    });
+    let previewUrl = '';
+    function paintPhoto() {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = photo ? URL.createObjectURL(photo) : '';
+      photoBox.replaceChildren(...[
+        photo && h('div', { class: 'cover cover-preview loaded' }, h('img', { alt: 'Фото обложки', src: previewUrl })),
+        h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => picker.click() },
+          photo ? '📷 Выбрать другое фото' : '📷 Добавить фото обложки'),
+        photo && h('button', { type: 'button', class: 'btn-link danger', onclick: () => { photo = null; paintPhoto(); } }, 'Убрать фото'),
+        picker].filter(Boolean)); // native replaceChildren would print null as text
+    }
+    paintPhoto();
 
     const form = h('form', {
       class: 'card form', novalidate: true,
@@ -375,15 +579,24 @@
           return;
         }
         busy(submit, true);
+        if (preparing) await preparing;
+        let book;
         try {
-          const book = await api('POST', 'api/books', { title: title.value, author: author.value, link: link.value, note: note.value });
-          haptic('success');
-          toast('Книга добавлена');
-          location.replace('#/books/' + book.id);
+          book = await api('POST', 'api/books', { title: title.value, author: author.value, link: link.value, note: note.value });
         } catch (ex) {
           err.show(ex.message);
           busy(submit, false);
+          return;
         }
+        // The book is saved either way; a failed photo can be added again on the book's page.
+        let photoFailed = false;
+        if (photo) {
+          submit.textContent = 'Загружаю фото…';
+          try { await uploadCover(book.id, photo); } catch (_) { photoFailed = true; }
+        }
+        haptic(photoFailed ? 'warning' : 'success');
+        toast(photoFailed ? 'Книга добавлена, но фото не загрузилось — попробуйте ещё раз на странице книги' : 'Книга добавлена');
+        location.replace('#/books/' + book.id);
       },
     },
       h('h1', { class: 'screen-title' }, 'Новая книга'),
@@ -391,6 +604,8 @@
       field('Автор', author, 'Можно не заполнять'),
       field('Ссылка на книгу', link, 'Необязательно. Например, страница книги в магазине или библиотеке'),
       field('Пара слов о книге', note, 'Необязательно'),
+      me.covers && h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Фото обложки'), photoBox,
+        h('span', { class: 'field-hint' }, 'Необязательно. Сфотографируйте обложку или выберите снимок из галереи')),
       err.el,
       submit);
 
@@ -404,6 +619,7 @@
       const b = d.book;
 
       const head = h('section', { class: 'card book-head' },
+        b.coverUrl && cover(b.coverUrl, 'cover-big'),
         h('h1', { class: 'book-title big' }, b.title),
         b.author && h('div', { class: 'book-author' }, b.author),
         h('div', { class: 'rating-summary' },
@@ -412,6 +628,8 @@
             : h('span', { class: 'hint' }, 'Отзывов пока нет — ваш может стать первым')),
         b.note && h('p', { class: 'note' }, b.note),
         b.link && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => openExternal(b.link) }, 'Открыть книгу по ссылке ↗'),
+        canShare() && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => shareBook(b) }, 'Поделиться книгой в группе'),
+        me.covers && b.canEdit && coverControls(b),
         h('p', { class: 'hint small added' }, `Добавлено: ${b.addedBy}, ${fmtDate(b.createdAt)}`));
 
       const nodes = [head, reviewForm(b, d.myReview),
@@ -426,7 +644,8 @@
           onclick: async (e) => {
             const warn = b.rating.count ? ` Вместе с ней удалятся отзывы (${b.rating.count}).` : '';
             const btn = e.currentTarget; // currentTarget is null once we await
-            if (!(await confirmDialog(`Удалить книгу «${b.title}»?${warn}`))) return;
+            const whose = b.mine ? '' : ` Её добавил(а) ${b.addedBy}.`;
+            if (!(await confirmDialog(`Удалить книгу «${b.title}»?${whose}${warn}`))) return;
             busy(btn, true, 'Удаляю…');
             try {
               await api('DELETE', 'api/books/' + b.id);
@@ -443,6 +662,40 @@
     });
   }
 
+  // Add / replace / remove the cover photo on the book's page.
+  function coverControls(b) {
+    const err = errorLine();
+    const pick = h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => picker.click() },
+      b.coverUrl ? '📷 Заменить фото обложки' : '📷 Добавить фото обложки');
+    const picker = photoPicker(async (file) => {
+      err.hide();
+      busy(pick, true, 'Загружаю фото…');
+      try {
+        await uploadCover(b.id, await preparePhoto(file));
+        haptic('success');
+        toast(b.coverUrl ? 'Фото заменено' : 'Фото добавлено');
+        refresh();
+      } catch (ex) {
+        err.show(ex.message);
+        busy(pick, false);
+      }
+    });
+    const remove = b.coverUrl && h('button', {
+      type: 'button', class: 'btn-link danger',
+      onclick: async () => {
+        if (!(await confirmDialog('Убрать фото обложки?'))) return;
+        try {
+          await api('DELETE', `api/books/${b.id}/cover`);
+          toast('Фото убрано');
+          refresh();
+        } catch (ex) {
+          err.show(ex.message);
+        }
+      },
+    }, 'Убрать фото');
+    return h('div', { class: 'cover-controls' }, pick, picker, err.el, remove);
+  }
+
   function reviewForm(book, mine) {
     let rating = mine ? mine.rating : 0;
     const text = h('textarea', {
@@ -452,6 +705,40 @@
     });
     const err = errorLine();
     const save = h('button', { type: 'submit', class: 'btn btn-primary' }, mine ? 'Сохранить изменения' : 'Опубликовать отзыв');
+
+    // One photo per review. Like the new-book form: shrunk as soon as it's picked, uploaded after the
+    // review is saved (a new review has no ID before that).
+    const savedPhoto = mine && mine.photoUrl;
+    let photo = null;        // a newly picked photo, not uploaded yet
+    let dropSaved = false;   // remove the saved photo on save
+    let preparing = null;    // Promise while a picked photo is being shrunk
+    const photoBox = h('div', { class: 'photo-field' });
+    const picker = photoPicker((file) => {
+      err.hide();
+      preparing = preparePhoto(file).then((blob) => {
+        photo = blob;
+        paintPhoto();
+      }, (ex) => {
+        err.show(ex.message);
+      }).finally(() => { preparing = null; });
+    });
+    let previewUrl = '';
+    function paintPhoto() {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = photo ? URL.createObjectURL(photo) : '';
+      const showSaved = !photo && savedPhoto && !dropSaved;
+      photoBox.replaceChildren(...[
+        photo && h('div', { class: 'cover review-photo loaded' }, h('img', { alt: 'Фото к отзыву', src: previewUrl })),
+        showSaved && cover(savedPhoto, 'review-photo', false, 'Фото к отзыву'),
+        h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => picker.click() },
+          photo || showSaved ? '📷 Выбрать другое фото' : '📷 Добавить фото'),
+        (photo || showSaved) && h('button', {
+          type: 'button', class: 'btn-link danger',
+          onclick: () => { if (photo) photo = null; else dropSaved = true; paintPhoto(); },
+        }, 'Убрать фото'),
+        picker].filter(Boolean));
+    }
+    paintPhoto();
 
     const remove = mine && h('button', {
       type: 'button', class: 'btn-link danger',
@@ -467,6 +754,11 @@
       },
     }, 'Удалить мой отзыв');
 
+    // Shares the saved review, not unsaved edits in the text box.
+    const share = mine && canShare() && h('button', {
+      type: 'button', class: 'btn btn-secondary', onclick: () => shareReview(book, mine),
+    }, 'Поделиться отзывом в группе');
+
     return h('form', {
       class: 'card review-form', novalidate: true,
       onsubmit: async (e) => {
@@ -477,20 +769,43 @@
           return;
         }
         busy(save, true);
-        try {
-          await api('PUT', `api/books/${book.id}/review`, { rating, text: text.value });
-          haptic('success');
-          toast(mine ? 'Отзыв обновлён' : 'Спасибо за отзыв!');
-          refresh();
-        } catch (ex) {
-          err.show(ex.message);
-          busy(save, false);
+        if (preparing) await preparing;
+        // Only the photo changed: don't touch the review, or it would show up as "изменён".
+        const textChanged = !mine || rating !== mine.rating || text.value.trim() !== (mine.text || '');
+        let saved = mine;
+        if (textChanged) {
+          try {
+            saved = await api('PUT', `api/books/${book.id}/review`, { rating, text: text.value });
+          } catch (ex) {
+            err.show(ex.message);
+            busy(save, false);
+            return;
+          }
         }
+        // The review is saved either way; a failed photo can be added again.
+        let photoFailed = false;
+        try {
+          if (photo) {
+            save.textContent = 'Загружаю фото…';
+            await uploadReviewPhoto(saved.id, photo);
+          } else if (dropSaved && savedPhoto) {
+            await api('DELETE', `api/reviews/${saved.id}/photo`);
+          }
+        } catch (_) {
+          photoFailed = true;
+        }
+        haptic(photoFailed ? 'warning' : 'success');
+        toast(photoFailed ? 'Отзыв сохранён, но фото не обновилось — попробуйте ещё раз'
+          : mine ? 'Отзыв обновлён' : canShare() ? 'Спасибо! Отзывом можно поделиться в группе' : 'Спасибо за отзыв!');
+        refresh();
       },
     },
       h('h2', { class: 'card-title' }, mine ? 'Ваш отзыв' : 'Ваш отзыв о книге'),
       starPicker(rating, (v) => { rating = v; err.hide(); }),
-      text, err.el, save, remove);
+      text,
+      me.covers && h('div', { class: 'field review-photo-field' }, photoBox,
+        h('span', { class: 'field-hint' }, 'Необязательно. Одно фото — например, любимая страница или книга на полке')),
+      err.el, save, share, remove);
   }
 
   function reviewCard(r) {
@@ -501,6 +816,7 @@
     const card = h('article', { class: 'card review' },
       h('div', { class: 'review-head' }, h('span', { class: 'review-author' }, r.author), stars(r.rating)),
       body,
+      r.photoUrl && cover(r.photoUrl, 'review-photo', true, 'Фото к отзыву'),
       long && h('button', {
         type: 'button', class: 'btn-link',
         onclick: (e) => { body.classList.remove('clamped'); e.currentTarget.remove(); },
@@ -535,10 +851,13 @@
       const upcoming = meetings.filter((m) => new Date(m.startsAt).getTime() + STILL_UPCOMING_MS >= now);
       const past = meetings.filter((m) => !upcoming.includes(m)).reverse();
 
-      const nodes = [h('a', { class: 'btn btn-primary', href: '#/meetings/new' }, '+ Назначить встречу')];
+      const nodes = [];
+      if (me.canManageMeetings) nodes.push(h('a', { class: 'btn btn-primary', href: '#/meetings/new' }, '+ Назначить встречу'));
 
       if (!upcoming.length) {
-        nodes.push(empty('Ближайших встреч пока нет', 'Нажмите «Назначить встречу», чтобы добавить дату.'));
+        nodes.push(empty('Ближайших встреч пока нет', me.canManageMeetings
+          ? 'Нажмите «Назначить встречу», чтобы добавить дату.'
+          : 'Как только администратор назначит встречу, она появится здесь.'));
       } else {
         const [next, ...rest] = upcoming;
         nodes.push(h('h2', { class: 'section-title' }, 'Ближайшая встреча'), meetingCard(next, true));
@@ -569,10 +888,14 @@
         h('span', null, `«${m.book.title}»${m.book.author ? ', ' + m.book.author : ''}`)),
       m.note && h('p', { class: 'note' }, m.note),
       online && h('button', { type: 'button', class: 'btn btn-secondary', onclick: () => openExternal(m.place) }, 'Подключиться онлайн ↗'),
-      h('a', { class: 'btn btn-secondary', href: `#/meetings/${m.id}/edit` }, 'Изменить'));
+      me.canManageMeetings && h('a', { class: 'btn btn-secondary', href: `#/meetings/${m.id}/edit` }, 'Изменить'));
   }
 
   function renderMeetingForm(seq, id) {
+    if (!me.canManageMeetings) {
+      $view.replaceChildren(errorBox(new ApiError(403, 'Назначать и менять встречи может только администратор клуба.')));
+      return;
+    }
     load(seq, async () => {
       const [booksResp, meetingsResp] = await Promise.all([api('GET', 'api/books'), id ? api('GET', 'api/meetings') : null]);
       const current = id ? meetingsResp.meetings.find((x) => x.id === id) : null;
@@ -681,6 +1004,40 @@
     });
   }
 
+  // Shown while the club isn't fully configured: the values for ADMIN_IDS and CLUB_CHAT_INSTANCE,
+  // so the owner can set them up without access to server logs. Disappears once both are set.
+  function setupCard(s) {
+    const copy = (value) => h('button', {
+      type: 'button', class: 'btn-link small',
+      onclick: async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          toast('Скопировано');
+        } catch {
+          toast('Не получилось скопировать — выделите текст пальцем');
+        }
+      },
+    }, 'Скопировать');
+    const row = (label, value) => h('div', { class: 'setup-row' },
+      h('span', { class: 'meeting-label' }, label), h('code', null, value), copy(value));
+
+    const fromGroup = s.chatType === 'group' || s.chatType === 'supergroup';
+    return h('section', { class: 'card setup' },
+      h('div', { class: 'empty-title' }, 'Настройка клуба'),
+      s.needAdmins && [
+        h('p', { class: 'hint small' }, 'Администраторов пока нет. Ваш Telegram ID — для ADMIN_IDS:'),
+        row('Ваш ID', String(s.userId)),
+      ],
+      s.needAccess && [
+        h('p', { class: 'hint small' }, 'Приложение сейчас открывает любой, у кого есть ссылка.'),
+        fromGroup
+          ? [h('p', { class: 'hint small' }, 'Этот чат — группа. Его chat_instance — для CLUB_CHAT_INSTANCE:'), row('Чат', s.chatInstance)]
+          : h('p', { class: 'hint small' },
+            'Чтобы увидеть chat_instance группы клуба, откройте приложение по ссылке из этой группы, например из закреплённого сообщения.'),
+      ],
+      h('p', { class: 'hint small' }, 'Блок исчезнет, когда обе настройки будут заданы.'));
+  }
+
   async function login() {
     $tabs.hidden = true;
     try {
@@ -689,9 +1046,35 @@
       $view.replaceChildren(errorBox(err));
       return;
     }
-    $footer.textContent = `Вы вошли как ${me.name}`;
-    if (routes.some(([re]) => re.test(location.hash))) render(true);
-    else location.replace('#/books');
+    $footer.replaceChildren(`Вы вошли как ${me.name}${me.isAdmin ? ' · администратор' : ''}`);
+    if (me.setup) $footer.append(setupCard(me.setup));
+    // The button under the bot's post in the group opens https://t.me/<bot>/<app>?startapp=book_<id>:
+    // go straight to that book.
+    const start = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || '';
+    const fromPost = /^book_([0-9a-f]+)$/.exec(start);
+    const target = routes.some(([re]) => re.test(location.hash)) ? location.hash
+      : fromPost ? '#/books/' + fromPost[1] : '#/books';
+
+    // An old post or shared message keeps pointing at its book after the book is deleted. Opening
+    // such a link shouldn't start on an error screen: go to the list and say why.
+    const book = /^#\/books\/([0-9a-f]+)$/.exec(target);
+    if (book && !(await bookExists(book[1]))) {
+      toast('Этой книги уже нет в клубе');
+      location.replace('#/books'); // the hash was a book's, so hashchange fires and renders the list
+      return;
+    }
+    if (target === location.hash) render(true);
+    else location.replace(target);
+  }
+
+  // false only for a definite "not found"; on any other error the book screen shows it as usual.
+  async function bookExists(id) {
+    try {
+      await api('GET', 'api/books/' + id);
+      return true;
+    } catch (err) {
+      return err.status !== 404;
+    }
   }
 
   setup();

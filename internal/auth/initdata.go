@@ -28,12 +28,18 @@ var (
 	ErrNoUser      = errors.New("initData: user is missing")
 )
 
-// User is the subset of WebAppUser the app needs.
+// User is the subset of WebAppUser the app needs, plus where the app was opened from.
 type User struct {
 	ID        int64  `json:"id"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name,omitempty"`
 	Username  string `json:"username,omitempty"`
+
+	// ChatInstance identifies the chat the Mini App was opened from; the same for everyone in that
+	// chat. Telegram sends it (and ChatType) only for launches from a direct link, t.me/<bot>/<app>.
+	// Both are covered by the signature, so they can't be forged.
+	ChatInstance string `json:"-"`
+	ChatType     string `json:"-"` // "group", "supergroup", "private", "sender", "channel"
 }
 
 // DisplayName is what other club members see next to a book or review.
@@ -103,6 +109,7 @@ func (v *Validator) Validate(initData string) (User, error) {
 	if u.ID == 0 {
 		return User{}, ErrNoUser
 	}
+	u.ChatInstance, u.ChatType = values.Get("chat_instance"), values.Get("chat_type")
 	return u, nil
 }
 

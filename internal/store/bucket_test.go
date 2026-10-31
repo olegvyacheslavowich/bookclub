@@ -151,6 +151,35 @@ func TestBucketValidationUsesFreshData(t *testing.T) {
 	}
 }
 
+func TestBucketSeesItemsJustAddedByAnotherInstance(t *testing.T) {
+	f, srv := newFakeS3(t)
+	a := openFakeBucket(t, srv, f.token)
+	b := openFakeBucket(t, srv, f.token)
+	b.refreshEvery = time.Hour // b has just checked and won't look again on its own
+
+	// A member adds a book on instance A; the request for its page lands on B.
+	book := must[Book](t)(a.AddBook(Book{Title: "Лавр", AddedBy: anna}))
+	if _, err := b.Book(book.ID); err != nil {
+		t.Fatalf("B doesn't see the book added through A: %v", err)
+	}
+
+	// The same for writes that refer to something B hasn't seen yet.
+	book2 := must[Book](t)(a.AddBook(Book{Title: "Обломов", AddedBy: anna}))
+	rv := must[Review](t)(b.UpsertReview(book2.ID, olga, 5, ""))
+	must[Meeting](t)(b.AddMeeting(Meeting{StartsAt: time.Now(), BookID: book2.ID}))
+	if _, err := a.Review(rv.ID); err != nil {
+		t.Fatalf("A doesn't see the review written through B: %v", err)
+	}
+
+	// Something that really doesn't exist is still "not found".
+	if _, err := b.Book("nope"); err != ErrNotFound {
+		t.Fatalf("missing book: %v", err)
+	}
+	if _, err := b.UpsertReview("nope", olga, 5, ""); err != ErrNotFound {
+		t.Fatalf("review of a missing book: %v", err)
+	}
+}
+
 func TestBucketReadsUseConditionalGet(t *testing.T) {
 	f, srv := newFakeS3(t)
 	s := openFakeBucket(t, srv, f.token)

@@ -239,6 +239,80 @@ h1, h2, p { margin: 0; }
 .stars.lg { font-size: 26px; }
 .stars-off { color: var(--hint); opacity: 0.35; }
 
+/* ------------------------------------------------------------- cover photos */
+
+.cover {
+  position: relative;
+  overflow: hidden;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.14);
+  background: color-mix(in srgb, var(--hint) 16%, transparent);
+}
+
+.cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.cover.loaded img { opacity: 1; }
+
+/* No photo (or it failed to load): a book icon in the empty frame. */
+.cover-none img { display: none; }
+.cover-none::after {
+  content: "📖";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  opacity: 0.5;
+}
+
+.book-card.with-cover {
+  display: grid;
+  grid-template-columns: 66px 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.book-card-text { min-width: 0; }
+.cover-thumb { width: 66px; height: 96px; }
+
+/* On the book's page the whole photo is shown, not cropped. */
+.cover-big {
+  width: fit-content;
+  max-width: 100%;
+  margin: -4px auto 16px;
+  border-radius: 10px;
+}
+
+.cover-big img { width: auto; max-width: 100%; height: auto; max-height: 420px; object-fit: contain; }
+.cover-big:not(.loaded) { width: 200px; height: 290px; }
+
+.cover-preview { width: 120px; height: 174px; margin-bottom: 4px; }
+.photo-field .btn-secondary { margin-top: 8px; }
+.cover-controls .form-error { margin: 10px 0 0; }
+
+/* A review's photo: shown whole, not cropped, like the big cover. */
+.review-photo {
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 10px;
+  border-radius: 10px;
+}
+
+.review-photo img { width: auto; max-width: 100%; height: auto; max-height: 320px; object-fit: contain; }
+.review-photo:not(.loaded) { width: 100%; height: 180px; }
+/* A photo that failed to load is simply left out: the book icon would read as "no cover". */
+.review-photo.cover-none { display: none; }
+.review-photo-field { margin-top: 12px; }
+.review-photo-field .review-photo { margin: 0 0 4px; }
+
 /* ------------------------------------------------------------- reviews */
 
 .review-form, .book-head { margin-top: 0; }
@@ -355,6 +429,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 
 footer { margin-top: 36px; color: var(--hint); font-size: 14px; text-align: center; }
 
+.setup { margin-top: 14px; color: var(--text); text-align: left; }
+.setup p { margin-top: 8px; }
+.setup-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 6px; }
+.setup-row code { font-size: 16px; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+
 .toast {
   position: fixed;
   left: 50%;
@@ -376,5 +455,5 @@ footer { margin-top: 36px; color: var(--hint); font-size: 14px; text-align: cent
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
 @media (prefers-reduced-motion: reduce) {
-  .toast, .star-btn { transition: none; }
+  .toast, .star-btn, .cover img { transition: none; }
 }

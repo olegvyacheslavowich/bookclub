@@ -38,36 +38,48 @@ func (f fakeMembers) IsMember(_ context.Context, id int64) (bool, error) {
 const (
 	anna     = "anna"
 	olga     = "olga"
+	nina     = "nina" // the administrator in newAdminHarness
 	stranger = "stranger"
 	broken   = "broken"
 )
 
 type harness struct {
-	t   *testing.T
-	srv *httptest.Server
+	t     *testing.T
+	srv   *httptest.Server
+	posts *fakeAnnouncer
 }
 
-func newHarness(t *testing.T) *harness {
+func newHarness(t *testing.T) *harness { t.Helper(); return newHarnessWith(t, nil) }
+
+// newAdminHarness: Nina (ID 4) is the club's administrator.
+func newAdminHarness(t *testing.T) *harness { t.Helper(); return newHarnessWith(t, []int64{4}) }
+
+func newHarnessWith(t *testing.T, adminIDs []int64) *harness {
 	t.Helper()
 	st, err := store.OpenFile(filepath.Join(t.TempDir(), "data.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	posts := &fakeAnnouncer{}
 	s := New(Config{
-		Store: st,
+		Announcer: posts,
+		AppURL:    "https://t.me/club_bot/club",
+		Store:     st,
 		Auth: fakeAuth{
 			anna:     {ID: 1, FirstName: "Анна"},
 			olga:     {ID: 2, FirstName: "Ольга"},
+			nina:     {ID: 4, FirstName: "Нина"},
 			stranger: {ID: 3, FirstName: "Чужой"},
 			broken:   {ID: 500, FirstName: "Сбой"},
 		},
-		Members: fakeMembers{1: true, 2: true},
-		Static:  fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}},
-		Logger:  discardLogger(),
+		Members:  fakeMembers{1: true, 2: true, 4: true},
+		AdminIDs: adminIDs,
+		Static:   fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}},
+		Logger:   discardLogger(),
 	})
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
-	return &harness{t: t, srv: srv}
+	return &harness{t: t, srv: srv, posts: posts}
 }
 
 // do sends a request as `who` and decodes the JSON answer into out (if non-nil).
@@ -114,7 +126,7 @@ func TestAccess(t *testing.T) {
 
 	var me meDTO
 	h.do(anna, "GET", "/api/me", "", &me)
-	if me.ID != 1 || me.Name != "Анна" {
+	if me.ID != 1 || me.Name != "Анна" || me.AppURL != "https://t.me/club_bot/club" || me.IsAdmin || !me.CanManageMeetings {
 		t.Fatalf("got %+v", me)
 	}
 
@@ -177,7 +189,7 @@ func TestBookFlow(t *testing.T) {
 	if code := h.do(olga, "POST", "/api/books", `{"title":" Обломов ","author":"Гончаров","link":"litres.ru/book/oblomov"}`, &book); code != http.StatusCreated {
 		t.Fatalf("create: %d", code)
 	}
-	if book.Title != "Обломов" || book.Link != "https://litres.ru/book/oblomov" || book.AddedBy != "Ольга" || !book.CanDelete {
+	if book.Title != "Обломов" || book.Link != "https://litres.ru/book/oblomov" || book.AddedBy != "Ольга" || !book.CanDelete || !book.Mine {
 		t.Fatalf("got %+v", book)
 	}
 
@@ -300,5 +312,116 @@ func TestAuthorizationHeaderFallback(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Authorization header must still work, got %d", resp.StatusCode)
+	}
+}
+
+func TestSetupHintsUntilConfigured(t *testing.T) {
+	// The default harness checks membership but has no administrators.
+	var me meDTO
+	newHarness(t).do(anna, "GET", "/api/me", "", &me)
+	if me.Setup == nil || me.Setup.UserID != 1 || me.Setup.NeedAccess || !me.Setup.NeedAdmins {
+		t.Fatalf("no admins: %+v", me.Setup)
+	}
+
+	// Membership check and administrators both configured: nothing to set up.
+	me = meDTO{}
+	newAdminHarness(t).do(olga, "GET", "/api/me", "", &me)
+	if me.Setup != nil {
+		t.Fatalf("fully configured: %+v", me.Setup)
+	}
+
+	// Nothing configured, opened from a group: the group's chat_instance is shown.
+	st, err := store.OpenFile(filepath.Join(t.TempDir(), "data.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(Config{
+		Store:  st,
+		Auth:   fakeAuth{anna: {ID: 1, FirstName: "Анна", ChatInstance: "-777", ChatType: "supergroup"}},
+		Logger: discardLogger(),
+	}).Handler())
+	defer srv.Close()
+	me = meDTO{}
+	(&harness{t: t, srv: srv}).do(anna, "GET", "/api/me", "", &me)
+	if me.Setup == nil || !me.Setup.NeedAccess || !me.Setup.NeedAdmins || me.Setup.ChatInstance != "-777" || me.Setup.ChatType != "supergroup" {
+		t.Fatalf("nothing configured: %+v", me.Setup)
+	}
+}
+
+func TestAdminDeletesAnyBookAndReview(t *testing.T) {
+	h := newAdminHarness(t)
+
+	var me meDTO
+	h.do(nina, "GET", "/api/me", "", &me)
+	if !me.IsAdmin || !me.CanManageMeetings {
+		t.Fatalf("Nina: %+v", me)
+	}
+	h.do(olga, "GET", "/api/me", "", &me)
+	if me.IsAdmin || me.CanManageMeetings {
+		t.Fatalf("Olga: %+v", me)
+	}
+
+	var book bookDTO
+	h.do(olga, "POST", "/api/books", `{"title":"Обломов"}`, &book)
+	var review reviewDTO
+	h.do(anna, "PUT", "/api/books/"+book.ID+"/review", `{"rating":2,"text":"Скучно"}`, &review)
+
+	// The administrator sees delete buttons on other people's books and reviews, but they aren't hers.
+	var detail bookDetailDTO
+	h.do(nina, "GET", "/api/books/"+book.ID, "", &detail)
+	if !detail.Book.CanDelete || detail.Book.Mine || len(detail.Reviews) != 1 || !detail.Reviews[0].CanDelete || detail.Reviews[0].Mine {
+		t.Fatalf("admin view: %+v", detail)
+	}
+	// An ordinary member still doesn't.
+	h.do(anna, "GET", "/api/books/"+book.ID, "", &detail)
+	if detail.Book.CanDelete || detail.Book.Mine {
+		t.Fatalf("Anna's view of Olga's book: %+v", detail.Book)
+	}
+	if code := h.do(anna, "DELETE", "/api/books/"+book.ID, "", nil); code != http.StatusForbidden {
+		t.Fatalf("Anna deleting Olga's book: %d", code)
+	}
+
+	if code := h.do(nina, "DELETE", "/api/reviews/"+review.ID, "", nil); code != http.StatusNoContent {
+		t.Fatalf("admin deleting a review: %d", code)
+	}
+	if code := h.do(nina, "DELETE", "/api/books/"+book.ID, "", nil); code != http.StatusNoContent {
+		t.Fatalf("admin deleting a book: %d", code)
+	}
+	if code := h.do(olga, "GET", "/api/books/"+book.ID, "", nil); code != http.StatusNotFound {
+		t.Fatalf("deleted book: %d", code)
+	}
+}
+
+func TestOnlyAdminManagesMeetings(t *testing.T) {
+	h := newAdminHarness(t)
+	body := `{"startsAt":"2026-11-15T18:00:00+05:00","place":"Кофейня"}`
+
+	var errBody map[string]string
+	if code := h.do(anna, "POST", "/api/meetings", body, &errBody); code != http.StatusForbidden || errBody["error"] == "" {
+		t.Fatalf("member scheduling a meeting: %d %v", code, errBody)
+	}
+
+	var m meetingDTO
+	if code := h.do(nina, "POST", "/api/meetings", body, &m); code != http.StatusCreated {
+		t.Fatalf("admin scheduling a meeting: %d", code)
+	}
+	if code := h.do(anna, "PUT", "/api/meetings/"+m.ID, body, nil); code != http.StatusForbidden {
+		t.Fatalf("member changing a meeting: %d", code)
+	}
+	if code := h.do(anna, "DELETE", "/api/meetings/"+m.ID, "", nil); code != http.StatusForbidden {
+		t.Fatalf("member cancelling a meeting: %d", code)
+	}
+
+	// Everyone still sees the meetings.
+	var list struct{ Meetings []meetingDTO }
+	if code := h.do(anna, "GET", "/api/meetings", "", &list); code != http.StatusOK || len(list.Meetings) != 1 {
+		t.Fatalf("member listing meetings: %d %+v", code, list.Meetings)
+	}
+
+	if code := h.do(nina, "PUT", "/api/meetings/"+m.ID, `{"startsAt":"2026-11-16T18:00:00+05:00"}`, nil); code != http.StatusOK {
+		t.Fatalf("admin changing a meeting: %d", code)
+	}
+	if code := h.do(nina, "DELETE", "/api/meetings/"+m.ID, "", nil); code != http.StatusNoContent {
+		t.Fatalf("admin cancelling a meeting: %d", code)
 	}
 }

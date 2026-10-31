@@ -36,11 +36,23 @@ type cacheEntry struct {
 	expires time.Time
 }
 
-func NewMemberChecker(botToken, chatID string) *MemberChecker {
+// DefaultAPIURL is the Bot API address. From servers in Russia it is often unreachable since
+// March 2026, so it can be replaced with a reverse proxy abroad (see TELEGRAM_API_URL in main).
+const DefaultAPIURL = "https://api.telegram.org"
+
+func apiURL(baseURL string) string {
+	if baseURL == "" {
+		return DefaultAPIURL
+	}
+	return strings.TrimRight(baseURL, "/")
+}
+
+// NewMemberChecker: baseURL "" means DefaultAPIURL.
+func NewMemberChecker(baseURL, botToken, chatID string) *MemberChecker {
 	return &MemberChecker{
 		token:   botToken,
 		chatID:  chatID,
-		baseURL: "https://api.telegram.org",
+		baseURL: apiURL(baseURL),
 		client:  &http.Client{Timeout: 5 * time.Second},
 		posTTL:  10 * time.Minute,
 		negTTL:  time.Minute,

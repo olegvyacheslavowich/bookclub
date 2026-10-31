@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"math"
 	"net/http"
@@ -18,6 +19,27 @@ import (
 type meDTO struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+	// AppURL is the Mini App direct link; the front end puts it into "share to the group" messages.
+	AppURL  string `json:"appUrl,omitempty"`
+	IsAdmin bool   `json:"isAdmin"`
+	// Covers: photo storage is configured, so books may have cover photos.
+	Covers bool `json:"covers"`
+	// CanManageMeetings: may schedule, change and cancel meetings (administrators, or everyone
+	// when the club has none).
+	CanManageMeetings bool `json:"canManageMeetings"`
+	// Setup is present while the club isn't fully configured: no membership check or no
+	// administrators. It carries what the owner needs for CLUB_CHAT_INSTANCE and ADMIN_IDS,
+	// so they can be set up without reading server logs.
+	Setup *setupDTO `json:"setup,omitempty"`
+}
+
+type setupDTO struct {
+	UserID int64 `json:"userId"`
+	// ChatInstance of the chat the app was opened from; empty unless opened from a chat link.
+	ChatInstance string `json:"chatInstance,omitempty"`
+	ChatType     string `json:"chatType,omitempty"`
+	NeedAccess   bool   `json:"needAccess"` // neither CLUB_CHAT_INSTANCE nor CLUB_CHAT_ID is set
+	NeedAdmins   bool   `json:"needAdmins"` // ADMIN_IDS is empty
 }
 
 type ratingDTO struct {
@@ -31,11 +53,14 @@ type bookDTO struct {
 	Author    string    `json:"author,omitempty"`
 	Link      string    `json:"link,omitempty"`
 	Note      string    `json:"note,omitempty"`
+	CoverURL  string    `json:"coverUrl,omitempty"` // relative URL of the cover photo; empty: no photo
 	AddedBy   string    `json:"addedBy"`
 	CreatedAt time.Time `json:"createdAt"`
 	Rating    ratingDTO `json:"rating"`
 	MyRating  int       `json:"myRating,omitempty"`
-	CanDelete bool      `json:"canDelete"`
+	Mine      bool      `json:"mine"`      // added by the caller
+	CanDelete bool      `json:"canDelete"` // the caller's own book, or the caller is an administrator
+	CanEdit   bool      `json:"canEdit"`   // may change the cover photo: same people as CanDelete
 }
 
 type reviewDTO struct {
@@ -43,10 +68,15 @@ type reviewDTO struct {
 	Author    string    `json:"author"`
 	Rating    int       `json:"rating"`
 	Text      string    `json:"text,omitempty"`
+	PhotoURL  string    `json:"photoUrl,omitempty"` // relative URL of the review's photo; empty: none
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	Mine      bool      `json:"mine"`
-	CanDelete bool      `json:"canDelete"`
+	CanDelete bool      `json:"canDelete"` // also: may remove the photo
+	// ShareURL (own review only): the link with a photo preview to share to the group — the photo's
+	// public link on Yandex Disk, or our own preview page relative to the app. Empty when there is
+	// no photo to show.
+	ShareURL string `json:"shareUrl,omitempty"`
 }
 
 type bookDetailDTO struct {
@@ -71,8 +101,22 @@ type meetingDTO struct {
 
 // ---- me ----
 
-func (s *Server) me(w http.ResponseWriter, _ *http.Request, u store.Person) {
-	writeJSON(w, http.StatusOK, meDTO{ID: u.ID, Name: u.Name})
+func (s *Server) me(w http.ResponseWriter, r *http.Request, u store.Person) {
+	out := meDTO{
+		ID: u.ID, Name: u.Name, AppURL: s.appURL,
+		IsAdmin: s.isAdmin(u.ID), CanManageMeetings: s.canManageMeetings(u.ID),
+		Covers: s.covers != nil,
+	}
+	// Neither value is a secret: the ID is the caller's own, and chat_instance only lets in requests
+	// whose initData Telegram signed for that chat, which can't be forged.
+	if needAccess, needAdmins := !s.accessRestricted(), len(s.admins) == 0; needAccess || needAdmins {
+		c := callerFrom(r)
+		out.Setup = &setupDTO{
+			UserID: u.ID, ChatInstance: c.chatInstance, ChatType: c.chatType,
+			NeedAccess: needAccess, NeedAdmins: needAdmins,
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---- books ----
@@ -101,21 +145,35 @@ func accumulate(reviews []store.Review, me int64) map[string]ratingAcc {
 }
 
 func (s *Server) toBookDTO(b store.Book, acc ratingAcc, u store.Person) bookDTO {
-	return bookDTO{
+	d := bookDTO{
 		ID: b.ID, Title: b.Title, Author: b.Author, Link: b.Link, Note: b.Note,
 		AddedBy: b.AddedBy.Name, CreatedAt: b.CreatedAt,
 		Rating: acc.dto(), MyRating: acc.mine,
-		CanDelete: b.AddedBy.ID == u.ID,
+		Mine:      b.AddedBy.ID == u.ID,
+		CanDelete: s.canEditBook(b, u),
+		CanEdit:   s.canEditBook(b, u),
 	}
+	if s.covers != nil {
+		d.CoverURL = coverURL(b)
+	}
+	return d
 }
 
-func (s *Server) toReviewDTO(r store.Review, u store.Person) reviewDTO {
-	return reviewDTO{
+// toReviewDTO: for the caller's own review it may publish the photo on Disk (see reviewShareURL).
+func (s *Server) toReviewDTO(ctx context.Context, r store.Review, b store.Book, u store.Person) reviewDTO {
+	d := reviewDTO{
 		ID: r.ID, Author: r.Author.Name, Rating: r.Rating, Text: r.Text,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		Mine:      r.Author.ID == u.ID,
-		CanDelete: r.Author.ID == u.ID,
+		CanDelete: r.Author.ID == u.ID || s.isAdmin(u.ID),
 	}
+	if s.covers != nil {
+		d.PhotoURL = reviewPhotoURL(r)
+	}
+	if d.Mine {
+		d.ShareURL = s.reviewShareURL(ctx, b, r)
+	}
+	return d
 }
 
 func (s *Server) listBooks(w http.ResponseWriter, _ *http.Request, u store.Person) {
@@ -167,6 +225,7 @@ func (s *Server) createBook(w http.ResponseWriter, r *http.Request, u store.Pers
 		s.internalError(w, r, err)
 		return
 	}
+	s.announce(r, "book", s.newBookMessage(saved))
 	writeJSON(w, http.StatusCreated, s.toBookDTO(saved, ratingAcc{}, u))
 }
 
@@ -182,7 +241,7 @@ func (s *Server) getBook(w http.ResponseWriter, r *http.Request, u store.Person)
 		Reviews: make([]reviewDTO, 0, len(reviews)),
 	}
 	for _, rv := range reviews {
-		d := s.toReviewDTO(rv, u)
+		d := s.toReviewDTO(r.Context(), rv, b, u)
 		if d.Mine {
 			out.MyReview = &d
 			continue
@@ -198,13 +257,21 @@ func (s *Server) deleteBook(w http.ResponseWriter, r *http.Request, u store.Pers
 		writeError(w, http.StatusNotFound, "Книга не найдена — возможно, её уже удалили.")
 		return
 	}
-	if b.AddedBy.ID != u.ID {
-		writeError(w, http.StatusForbidden, "Удалить книгу может только тот, кто её добавил.")
+	if !s.canEditBook(b, u) {
+		writeError(w, http.StatusForbidden, "Удалить книгу может только тот, кто её добавил, или администратор клуба.")
 		return
 	}
+	reviews := s.store.Reviews(b.ID) // their photos go with the book
 	if err := s.store.DeleteBook(b.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.internalError(w, r, err)
 		return
+	}
+	s.dropCover(b.Cover)
+	for _, rv := range reviews {
+		s.dropCover(rv.Photo)
+	}
+	if b.AddedBy.ID != u.ID {
+		s.log.Info("admin deleted book", "admin", u.Name, "book", b.Title, "added_by", b.AddedBy.Name)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -238,7 +305,13 @@ func (s *Server) putReview(w http.ResponseWriter, r *http.Request, u store.Perso
 	case err != nil:
 		s.internalError(w, r, err)
 	default:
-		writeJSON(w, http.StatusOK, s.toReviewDTO(saved, u))
+		b, _ := s.store.Book(saved.BookID) // just checked by UpsertReview; a miss only drops ShareURL
+		// Only a new review is posted to the group: edits would turn into spam.
+		// After a save retried on conflict, saved is still the final version, so there is one post.
+		if saved.CreatedAt.Equal(saved.UpdatedAt) && b.ID != "" {
+			s.announce(r, "review", s.newReviewMessage(b, saved))
+		}
+		writeJSON(w, http.StatusOK, s.toReviewDTO(r.Context(), saved, b, u))
 	}
 }
 
@@ -248,13 +321,17 @@ func (s *Server) deleteReview(w http.ResponseWriter, r *http.Request, u store.Pe
 		writeError(w, http.StatusNotFound, "Отзыв не найден — возможно, его уже удалили.")
 		return
 	}
-	if rv.Author.ID != u.ID {
-		writeError(w, http.StatusForbidden, "Удалить отзыв может только его автор.")
+	if rv.Author.ID != u.ID && !s.isAdmin(u.ID) {
+		writeError(w, http.StatusForbidden, "Удалить отзыв может только его автор или администратор клуба.")
 		return
 	}
 	if err := s.store.DeleteReview(rv.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.internalError(w, r, err)
 		return
+	}
+	s.dropCover(rv.Photo)
+	if rv.Author.ID != u.ID {
+		s.log.Info("admin deleted review", "admin", u.Name, "book_id", rv.BookID, "author", rv.Author.Name)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -306,8 +383,19 @@ func (in meetingInput) validate() (store.Meeting, error) {
 	return m, nil
 }
 
-// Any club member may schedule, change or cancel a meeting: the club has no administrators.
+// requireMeetingManager writes 403 unless the caller may schedule, change and cancel meetings.
+func (s *Server) requireMeetingManager(w http.ResponseWriter, u store.Person) bool {
+	if s.canManageMeetings(u.ID) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "Назначать, менять и отменять встречи может только администратор клуба.")
+	return false
+}
+
 func (s *Server) createMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
+	if !s.requireMeetingManager(w, u) {
+		return
+	}
 	var in meetingInput
 	if !decodeJSON(w, r, &in) {
 		return
@@ -322,7 +410,10 @@ func (s *Server) createMeeting(w http.ResponseWriter, r *http.Request, u store.P
 	s.respondMeeting(w, r, http.StatusCreated, saved, err)
 }
 
-func (s *Server) updateMeeting(w http.ResponseWriter, r *http.Request, _ store.Person) {
+func (s *Server) updateMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
+	if !s.requireMeetingManager(w, u) {
+		return
+	}
 	var in meetingInput
 	if !decodeJSON(w, r, &in) {
 		return
@@ -354,7 +445,10 @@ func (s *Server) respondMeeting(w http.ResponseWriter, r *http.Request, status i
 	}
 }
 
-func (s *Server) deleteMeeting(w http.ResponseWriter, r *http.Request, _ store.Person) {
+func (s *Server) deleteMeeting(w http.ResponseWriter, r *http.Request, u store.Person) {
+	if !s.requireMeetingManager(w, u) {
+		return
+	}
 	err := s.store.DeleteMeeting(r.PathValue("id"))
 	switch {
 	case errors.Is(err, store.ErrNotFound):

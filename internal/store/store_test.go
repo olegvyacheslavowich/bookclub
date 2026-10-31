@@ -142,3 +142,94 @@ func TestOpenRejectsNewerVersion(t *testing.T) {
 		t.Fatal("want error for unsupported version")
 	}
 }
+
+func TestSetCover(t *testing.T) {
+	s, path := openTemp(t)
+	b := must[Book](t)(s.AddBook(Book{Title: "Обломов"}))
+
+	if old := must[string](t)(s.SetCover(b.ID, "a.jpg")); old != "" {
+		t.Fatalf("old = %q", old)
+	}
+	if old := must[string](t)(s.SetCover(b.ID, "b.jpg")); old != "a.jpg" {
+		t.Fatalf("old = %q", old)
+	}
+	if _, err := s.SetCover("missing", "c.jpg"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+
+	reopened, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := must[Book](t)(reopened.Book(b.ID)); got.Cover != "b.jpg" {
+		t.Fatalf("cover after reopen: %q", got.Cover)
+	}
+}
+
+func TestSetReviewPhoto(t *testing.T) {
+	s, path := openTemp(t)
+	b := must[Book](t)(s.AddBook(Book{Title: "Обломов", AddedBy: anna}))
+	r := must[Review](t)(s.UpsertReview(b.ID, olga, 4, "Хорошо"))
+
+	if old := must[string](t)(s.SetReviewPhoto(r.ID, "a.jpg")); old != "" {
+		t.Fatalf("first photo: old = %q", old)
+	}
+	got := must[Review](t)(s.Review(r.ID))
+	if got.Photo != "a.jpg" || !got.UpdatedAt.Equal(r.UpdatedAt) {
+		t.Fatalf("a photo must not count as an edit: %+v", got)
+	}
+
+	// Editing the text keeps the photo.
+	edited := must[Review](t)(s.UpsertReview(b.ID, olga, 5, "Отлично"))
+	if edited.Photo != "a.jpg" {
+		t.Fatalf("photo lost on edit: %+v", edited)
+	}
+
+	if old := must[string](t)(s.SetReviewPhoto(r.ID, "b.jpg")); old != "a.jpg" {
+		t.Fatalf("replace: old = %q", old)
+	}
+	reopened, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := must[Review](t)(reopened.Review(r.ID)).Photo; p != "b.jpg" {
+		t.Fatalf("after reopen: %q", p)
+	}
+	if _, err := s.SetReviewPhoto("nope", "c.jpg"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown review: %v", err)
+	}
+}
+
+func TestSetPhotoLink(t *testing.T) {
+	s, _ := openTemp(t)
+	b := must[Book](t)(s.AddBook(Book{Title: "Обломов", AddedBy: anna}))
+	r := must[Review](t)(s.UpsertReview(b.ID, olga, 4, ""))
+	must[string](t)(s.SetCover(b.ID, "cover.jpg"))
+	must[string](t)(s.SetReviewPhoto(r.ID, "photo.jpg"))
+
+	if err := s.SetPhotoLink("cover.jpg", "https://yadi.sk/i/c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPhotoLink("photo.jpg", "https://yadi.sk/i/p"); err != nil {
+		t.Fatal(err)
+	}
+	if got := must[Book](t)(s.Book(b.ID)).CoverLink; got != "https://yadi.sk/i/c" {
+		t.Fatalf("cover link: %q", got)
+	}
+	if got := must[Review](t)(s.Review(r.ID)).PhotoLink; got != "https://yadi.sk/i/p" {
+		t.Fatalf("photo link: %q", got)
+	}
+
+	// A new photo forgets the old link: it pointed at the old file.
+	must[string](t)(s.SetCover(b.ID, "cover2.jpg"))
+	must[string](t)(s.SetReviewPhoto(r.ID, ""))
+	if got := must[Book](t)(s.Book(b.ID)).CoverLink; got != "" {
+		t.Fatalf("stale cover link: %q", got)
+	}
+	if got := must[Review](t)(s.Review(r.ID)).PhotoLink; got != "" {
+		t.Fatalf("stale photo link: %q", got)
+	}
+	if err := s.SetPhotoLink("cover.jpg", "x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("replaced file: %v", err)
+	}
+}

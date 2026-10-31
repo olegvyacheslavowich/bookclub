@@ -42,8 +42,19 @@ func TestValidate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if u.ID != 777 || u.DisplayName() != "Анна Петрова" {
+		if u.ID != 777 || u.DisplayName() != "Анна Петрова" || u.ChatInstance != "-42" {
 			t.Fatalf("got %+v", u)
+		}
+	})
+
+	t.Run("chat_instance can't be swapped", func(t *testing.T) {
+		vals, err := url.ParseQuery(sign(t, baseValues(now)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		vals.Set("chat_instance", "-1") // pretend to come from the club's group
+		if _, err := newTestValidator(now).Validate(vals.Encode()); !errors.Is(err, ErrBadHash) {
+			t.Fatalf("want ErrBadHash, got %v", err)
 		}
 	})
 

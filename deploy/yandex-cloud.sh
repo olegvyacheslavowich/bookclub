@@ -5,9 +5,32 @@
 # Needs: yc (after `yc init`, with a billing account linked), Docker (running), Go 1.24+, python3.
 # Usage:
 #   export BOT_TOKEN=123456:ABC...   # from @BotFather
-#   export CLUB_CHAT_ID=-100...      # optional: only members of this group get in
+#   export CLUB_CHAT_INSTANCE=-123...  # recommended: the app opens only from a link inside the club's group
+#   export CLUB_CHAT_ID=-100...      # optional: getChatMember check, needs api.telegram.org (TELEGRAM_API_URL)
+#   export MINIAPP_URL=https://t.me/<bot>/<app>   # optional: enables "share to the group" buttons
+#   export NOTIFY_GROUP=1            # optional: the bot itself posts new books and reviews (needs Bot API access)
+#   export ADMIN_IDS="111 222"       # optional: Telegram IDs of administrators (delete anything, schedule meetings)
+#   export YADISK_TOKEN=y0_...       # optional: Yandex Disk OAuth token, enables cover photos (README)
 #   ./deploy/yandex-cloud.sh
+#
+# Every run replaces the container's environment, so a variable missing at deploy time is gone from
+# the new revision. Put them once into .env in the project root (git-ignored) instead of exporting:
+#   BOT_TOKEN=123456:ABC...
+#   CLUB_CHAT_INSTANCE=-123...
+#   MINIAPP_URL=https://t.me/<bot>/<app>
+#   ADMIN_IDS="111 222"
+#   YADISK_TOKEN=y0_...
+#   TELEGRAM_API_URL=https://<proxy>/<secret>   # if api.telegram.org is unreachable from Yandex Cloud
 set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
 
 APP=${APP:-bookclub}
 CONTAINER=${CONTAINER:-bookclub}
@@ -15,9 +38,42 @@ SA_NAME=${SA_NAME:-bookclub-runner}
 REGISTRY_NAME=${REGISTRY_NAME:-bookclub}
 CONCURRENCY=${CONCURRENCY:-4}
 CLUB_CHAT_ID=${CLUB_CHAT_ID:-}
-: "${BOT_TOKEN:?Задайте BOT_TOKEN — токен бота от @BotFather}"
+CLUB_CHAT_INSTANCE=${CLUB_CHAT_INSTANCE:-}
+MINIAPP_URL=${MINIAPP_URL:-}
+NOTIFY_GROUP=${NOTIFY_GROUP:-}
+# --environment is one comma-separated flag, so IDs travel separated by spaces; the app accepts both.
+ADMIN_IDS=$(echo "${ADMIN_IDS:-}" | tr ',;' '  ' | xargs)
+# The app refuses to start on a bad ADMIN_IDS, and Serverless Containers then only say "exit status 1".
+for id in $ADMIN_IDS; do
+  if [[ ! $id =~ ^[1-9][0-9]*$ ]]; then
+    echo "ADMIN_IDS: «$id» — не Telegram ID. Нужен числовой ID (например 123456789), а не @имя." >&2
+    echo "Узнать его можно в приложении: блок «Настройка клуба» внизу экрана, пока ADMIN_IDS пустой." >&2
+    exit 1
+  fi
+done
+TELEGRAM_API_URL=${TELEGRAM_API_URL:-}
+YADISK_TOKEN=${YADISK_TOKEN:-}
+YADISK_DIR=${YADISK_DIR:-}
+if [[ $YADISK_DIR == *,* ]]; then
+  echo "YADISK_DIR не может содержать запятую: переменные контейнера передаются через запятую." >&2
+  exit 1
+fi
+: "${BOT_TOKEN:?Задайте BOT_TOKEN — токен бота от @BotFather (в .env или через export)}"
 
-cd "$(dirname "$0")/.."
+if [[ -z $CLUB_CHAT_INSTANCE && -z $CLUB_CHAT_ID ]]; then
+  cat >&2 <<'WARN'
+
+⚠️  Не задан ни CLUB_CHAT_INSTANCE, ни CLUB_CHAT_ID: приложение откроет любой, у кого есть ссылка.
+   Как включить вход только для участников — README, «Настройка в Telegram», шаг 4.
+WARN
+fi
+if [[ -n $CLUB_CHAT_ID && -z $TELEGRAM_API_URL ]]; then
+  cat >&2 <<'WARN'
+
+⚠️  CLUB_CHAT_ID задан без TELEGRAM_API_URL. Из Yandex Cloud api.telegram.org обычно недоступен,
+   и проверка через getChatMember будет падать по таймауту. Лучше CLUB_CHAT_INSTANCE.
+WARN
+fi
 
 need() { command -v "$1" >/dev/null || { echo "Не найден $1. $2" >&2; exit 1; }; }
 need yc "Установка: https://yandex.cloud/ru/docs/cli/quickstart"
@@ -86,6 +142,13 @@ fi
 
 ENVIRONMENT="DATA_BUCKET=$BUCKET,BOT_TOKEN=$BOT_TOKEN"
 [[ -n $CLUB_CHAT_ID ]] && ENVIRONMENT="$ENVIRONMENT,CLUB_CHAT_ID=$CLUB_CHAT_ID"
+[[ -n $CLUB_CHAT_INSTANCE ]] && ENVIRONMENT="$ENVIRONMENT,CLUB_CHAT_INSTANCE=$CLUB_CHAT_INSTANCE"
+[[ -n $MINIAPP_URL ]] && ENVIRONMENT="$ENVIRONMENT,MINIAPP_URL=$MINIAPP_URL"
+[[ -n $NOTIFY_GROUP ]] && ENVIRONMENT="$ENVIRONMENT,NOTIFY_GROUP=$NOTIFY_GROUP"
+[[ -n $ADMIN_IDS ]] && ENVIRONMENT="$ENVIRONMENT,ADMIN_IDS=$ADMIN_IDS"
+[[ -n $TELEGRAM_API_URL ]] && ENVIRONMENT="$ENVIRONMENT,TELEGRAM_API_URL=$TELEGRAM_API_URL"
+[[ -n $YADISK_TOKEN ]] && ENVIRONMENT="$ENVIRONMENT,YADISK_TOKEN=$YADISK_TOKEN"
+[[ -n $YADISK_DIR ]] && ENVIRONMENT="$ENVIRONMENT,YADISK_DIR=$YADISK_DIR"
 
 step "Новая ревизия"
 yc serverless container revision deploy \

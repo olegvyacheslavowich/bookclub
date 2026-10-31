@@ -31,7 +31,7 @@ func fakeTelegram(t *testing.T, calls *atomic.Int32, answer func(userID string) 
 }
 
 func checker(baseURL string, now *time.Time) *MemberChecker {
-	c := NewMemberChecker(token, "-100500")
+	c := NewMemberChecker("", token, "-100500")
 	c.baseURL = baseURL
 	c.now = func() time.Time { return *now }
 	return c
